@@ -1577,6 +1577,7 @@ export function SettingsView() {
                       onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                       placeholder="e.g. John Doe"
                       className="h-10 rounded-xl"
+                      autoComplete="off"
                       required
                     />
                   </div>
@@ -1588,6 +1589,7 @@ export function SettingsView() {
                       onChange={(e) => setFormData({ ...formData, username: e.target.value })}
                       placeholder="e.g. jdoe"
                       className="h-10 rounded-xl"
+                      autoComplete="off"
                       required
                     />
                   </div>
@@ -1601,6 +1603,7 @@ export function SettingsView() {
                     onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                     placeholder="e.g. jdoe@sejalglass.com"
                     className="h-10 rounded-xl"
+                    autoComplete="off"
                     required
                   />
                 </div>
@@ -1680,6 +1683,7 @@ export function SettingsView() {
                       onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                       placeholder="••••••••"
                       className="h-10 rounded-xl pr-10"
+                      autoComplete="new-password"
                       required
                     />
                     <button
@@ -1769,6 +1773,7 @@ export function SettingsView() {
                       value={formData.name}
                       onChange={(e) => setFormData({ ...formData, name: e.target.value })}
                       className="h-10 rounded-xl"
+                      autoComplete="off"
                       required
                     />
                   </div>
@@ -1780,6 +1785,7 @@ export function SettingsView() {
                       value={formData.email}
                       onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                       className="h-10 rounded-xl"
+                      autoComplete="off"
                       required
                     />
                   </div>
@@ -1893,6 +1899,7 @@ export function SettingsView() {
                       onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                       placeholder="New password (optional)"
                       className="h-10 rounded-xl pr-10"
+                      autoComplete="new-password"
                     />
                     <button
                       type="button"

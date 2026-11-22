@@ -1,7 +1,7 @@
 import { RequestHandler } from "express";
 import fs from "fs";
 import path from "path";
-import { GlassItem, PIMaster, ProductionHistory, RejectRecord, ReworkRecord, ProductionStage, SystemNotification, BARCODE_PREFIX, formatGenericBarcode, COLOURED_COATED_GLASS_REGEX, isGlassTypeColour } from "../../shared/api";
+import { GlassItem, PIMaster, ProductionHistory, RejectRecord, ReworkRecord, ProductionStage, SystemNotification, BARCODE_PREFIX, formatGenericBarcode, COLOURED_COATED_GLASS_REGEX, isGlassTypeColour, isDlguGlass, isDguGlass, isLaminatedGlass } from "../../shared/api";
 import { broadcastUpdate } from "./production";
 import { logger } from "../lib/logger";
 import { loadProductionFromMongo, saveProductionToMongo } from "../lib/mongodb";
@@ -16,6 +16,30 @@ export const productionHistoryDatabase: ProductionHistory[] = [];
 export const rejectDatabase: RejectRecord[] = [];
 export const reworkDatabase: ReworkRecord[] = [];
 export const notificationsDatabase: SystemNotification[] = [];
+
+export function isItemInPackingStage(i: any): boolean {
+  if (!i || i.isDispatched || i.currentStage === "Dispatched" || i.status === "Rejected") return false;
+  const isIgu = isDguGlass(i) || isDlguGlass(i) || i.glassCategory === "DGU" || i.glassCategory === "DLGU" || Boolean(i.dguPairId);
+  const isLami = !isIgu && (isLaminatedGlass(i) || i.glassCategory === "Laminated" || i.glassCategory === "Lamination");
+  if (!isIgu && !isLami) return false;
+  if (i.sentToFinished) return false;
+  if (i.packingRackNo && String(i.packingRackNo).toUpperCase().includes("DIRECT FINISH")) return false;
+  if (i.packingRackNo) return true;
+  const sentFromUpstream =
+    i.currentStage === "Finished" ||
+    (Array.isArray(i.completedStages) && (i.completedStages.includes("DGU") || i.completedStages.includes("Lamination") || i.completedStages.includes("Finished")));
+  return Boolean(sentFromUpstream);
+}
+
+export function isItemCompleted(i: any): boolean {
+  if (!i || i.status === "Rejected" || (i as any).isRejected) return false;
+  if (isItemInPackingStage(i)) return false;
+  if (i.isDispatched || i.currentStage === "Dispatched") return true;
+  if (Boolean(i.sentToFinished)) return true;
+  if (i.packingRackNo && String(i.packingRackNo).toUpperCase().includes("DIRECT FINISH")) return true;
+  if (i.currentStage === "Finished" && !isDguGlass(i) && !isDlguGlass(i) && !isLaminatedGlass(i)) return true;
+  return false;
+}
 
 interface PersistedData {
   piDatabase: PIMaster[];
@@ -93,6 +117,7 @@ export function loadDatabaseFromDisk(force = false): void {
             }
           }
         });
+
 
         // Normalize batches: 1 PDF is strictly 100% Colour or 100% Clear (never Mixed)
         const colourRegex = COLOURED_COATED_GLASS_REGEX;
@@ -391,13 +416,16 @@ export function loadDatabaseFromDisk(force = false): void {
             (i) => i.piId === pi.id || i.piNumber === pi.piNumber || i.piId === cleanId || i.piNumber === cleanPiNo
           );
           if (piItems.length > 0) {
-            const comp = piItems.filter((i) => (i.currentStage === "Finished" || i.currentStage === "Dispatched" || i.isDispatched || i.status === "Completed") && i.status !== "Rejected").length;
+            const comp = piItems.filter(isItemCompleted).length;
             if (pi.completedItemsCount !== comp) {
               pi.completedItemsCount = comp;
               dataChanged = true;
             }
-            if (comp >= piItems.length && pi.status !== "Completed") {
+            if (comp >= piItems.length && comp > 0 && pi.status !== "Completed") {
               pi.status = "Completed";
+              dataChanged = true;
+            } else if (comp < piItems.length && pi.status === "Completed") {
+              pi.status = "In Production";
               dataChanged = true;
             }
           }
@@ -671,9 +699,9 @@ export const handleGetPIs: RequestHandler = (req, res) => {
         (i.sfoNo && (i.sfoNo === pi.piNumber || i.sfoNo === cleanPiNo))
     );
     if (piItems.length > 0) {
-      const completedCount = piItems.filter((i) => (i.currentStage === "Finished" || i.currentStage === "Dispatched" || i.isDispatched || i.status === "Completed") && i.status !== "Rejected").length;
+      const completedCount = piItems.filter(isItemCompleted).length;
       pi.completedItemsCount = completedCount;
-      const newStatus = completedCount >= piItems.length && piItems.length > 0 ? "Completed" : (completedCount > 0 || piItems.some((i) => i.currentStage !== "Cutting" || i.completedStages?.length) ? "In Production" : (pi.status || "Pending"));
+      const newStatus = completedCount >= piItems.length && piItems.length > 0 ? "Completed" : (completedCount > 0 || piItems.some((i) => i.currentStage !== "Cutting" || i.completedStages?.length || isItemInPackingStage(i)) ? "In Production" : (pi.status || "Pending"));
       if (pi.status !== newStatus) {
         pi.status = newStatus;
         statusChanged = true;

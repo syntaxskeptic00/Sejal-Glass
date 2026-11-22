@@ -6,7 +6,7 @@ export interface UseBarcodeScannerOptions {
   onScan: (barcode: string) => void;
   /** Minimum length of barcode (default: 3) */
   minLen?: number;
-  /** Maximum inter-character arrival time in milliseconds for hardware scanner detection (default: 200ms) */
+  /** Maximum inter-character arrival time in milliseconds for hardware scanner detection (default: 70ms) */
   maxIntervalMs?: number;
   /** Cooldown time in ms between duplicate scans of the exact same barcode (default: 1800ms) */
   duplicateCooldownMs?: number;
@@ -47,7 +47,7 @@ let focusedInputElement: (HTMLInputElement | HTMLTextAreaElement) | null = null;
 let valueBeforeBurst = "";
 
 function handleGlobalKeyDown(e: KeyboardEvent) {
-  if (registeredScanners.length === 0) return;
+  if (registeredScanners.length === 0 || !e || !e.key || typeof e.key !== "string") return;
 
   const target = e.target as HTMLElement | null;
   const isInputElement =
@@ -79,7 +79,7 @@ function handleGlobalKeyDown(e: KeyboardEvent) {
   if (e.key === "Enter" || e.key === "Tab") {
     const rawCandidate = globalBuffer.trim();
     const candidate = cleanScannedBarcode(rawCandidate);
-    const wasBurst = isScannerBurst || charCountBurst >= 3;
+    const wasBurst = isScannerBurst && charCountBurst >= 3;
 
     // Reset buffer
     globalBuffer = "";
@@ -129,6 +129,8 @@ function handleGlobalKeyDown(e: KeyboardEvent) {
 
   // Ignore modifiers and special control keys (Alt, Shift, Ctrl, Meta, etc.)
   if (
+    !e.key ||
+    typeof e.key !== "string" ||
     e.key.length > 1 ||
     e.ctrlKey ||
     e.altKey ||
@@ -137,67 +139,24 @@ function handleGlobalKeyDown(e: KeyboardEvent) {
     return;
   }
 
-  // Detect hardware scanner typing speed (accommodates Bluetooth HID and 2.4GHz wireless scanners up to 200ms)
+  // Detect hardware scanner typing speed (hardware scanners transmit at 5-40ms per character)
   const maxInterval = registeredScanners.length > 0
     ? Math.max(...registeredScanners.map((s) => s.maxIntervalMs))
-    : 200;
+    : 70;
 
   if (elapsed > maxInterval) {
     // Gap too long: human typing or first character of a scanner burst
     globalBuffer = e.key;
     isScannerBurst = false;
     charCountBurst = 1;
-    if (isInputElement && (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) {
-      focusedInputElement = target;
-      // Record input value before this potential scanner burst begins
-      valueBeforeBurst = target.value;
-    } else {
-      focusedInputElement = null;
-      valueBeforeBurst = "";
-    }
+    focusedInputElement = null;
+    valueBeforeBurst = "";
   } else {
-    // Fast burst typical of hardware barcode scanners (<100ms/char)
+    // Fast burst typical of hardware barcode scanners (<70ms/char)
     globalBuffer += e.key;
     charCountBurst += 1;
-    if (charCountBurst >= 2) {
+    if (charCountBurst >= 4) {
       isScannerBurst = true;
-
-      // If an input was focused when the scanner gun fired, protect it from barcode pollution
-      if (
-        focusedInputElement &&
-        (focusedInputElement instanceof HTMLInputElement || focusedInputElement instanceof HTMLTextAreaElement)
-      ) {
-        const allowBarcode = focusedInputElement.getAttribute("data-allow-barcode-scan") === "true";
-        if (!allowBarcode) {
-          // Immediately revert any first character that leaked into the input using React-safe setter
-          try {
-            const nativeSetter = Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype,
-              "value"
-            )?.set;
-            if (nativeSetter) {
-              nativeSetter.call(focusedInputElement, valueBeforeBurst);
-            } else {
-              focusedInputElement.value = valueBeforeBurst;
-            }
-            focusedInputElement.dispatchEvent(new Event("input", { bubbles: true }));
-          } catch {
-            focusedInputElement.value = valueBeforeBurst;
-          }
-          focusedInputElement.blur();
-        }
-      }
-    }
-
-    if (isInputElement && isScannerBurst) {
-      const allowBarcode = target?.getAttribute("data-allow-barcode-scan") === "true";
-      if (!allowBarcode) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (target instanceof HTMLSelectElement) {
-          target.blur();
-        }
-      }
     }
   }
 }
@@ -231,7 +190,7 @@ export function simulateBarcodeScan(rawCode: string): boolean {
 export function useBarcodeScanner({
   onScan,
   minLen = 3,
-  maxIntervalMs = 280,
+  maxIntervalMs = 70,
   duplicateCooldownMs = 1800,
   enabled = true,
   ignoreWhenInputFocused = true,

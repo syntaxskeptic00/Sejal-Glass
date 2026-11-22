@@ -213,6 +213,7 @@ export interface StageAnalytics {
   capacityUtilization: number; // percentage 0-100
   rejectedCount?: number;
   qualityYield?: number; // percentage 0-100
+  unitLabel?: "Pcs" | "Units";
 }
 
 export interface DefectAnalytics {
@@ -269,6 +270,7 @@ export interface BottleneckInfo {
   riskLevel: "Low" | "Medium" | "High";
   avgWaitHours: number;
   bottleneckReason: string;
+  unitLabel?: "Pcs" | "Units";
 }
 
 export interface ProductTypeBreakdown {
@@ -289,6 +291,9 @@ export interface PerformanceAnalyticsData {
     totalGlassItems: number;
     completedGlassItems: number;
     inProgressGlassItems: number;
+    totalUnits?: number;
+    completedUnits?: number;
+    inProgressUnits?: number;
     completedSqm: number;
     inProgressSqm: number;
     rejectRate: number; // %

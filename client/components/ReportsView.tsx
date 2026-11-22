@@ -49,6 +49,7 @@ import {
   isLaminatedGlass,
   getDisplayStage,
   isItemInFinishedStage,
+  isItemCompleted,
   isDispatchedItem,
 } from "@/lib/utils";
 import { StatusBadge } from "@/components/ui/StatusBadge";
@@ -601,7 +602,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     const inProgressPis = totalPis - completedPis;
 
     const totalItems = items.length;
-    const completedItems = items.filter((i) => isItemInFinishedStage(i) || isDispatchedItem(i) || i.status === "Completed").length;
+    const completedItems = items.filter(isItemCompleted).length;
     const inProgressItems = totalItems - completedItems;
 
     let totalSqm = 0;
@@ -620,7 +621,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     items.forEach((i) => {
       const eff = getDguEffectiveQtyAndSqm(i);
       totalSqm += eff.sqm;
-      if (isItemInFinishedStage(i) || isDispatchedItem(i) || i.status === "Completed") {
+      if (isItemCompleted(i)) {
         completedSqm += eff.sqm;
       }
       if (i.status === "Rejected" || rejectedSerialSet.has(i.serialNumber) || (i.id && rejectedSerialSet.has(i.id))) {
@@ -672,11 +673,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     };
   }, [reportData]);
 
-  // Strict matching for PI Number / Batch Number
+  // Strict & flexible matching for PI Number / Batch Number / Identifiers
   const matchStrictPi = (item: any, query: string): boolean => {
     if (!query || !query.trim()) return true;
     const rawQ = query.trim().toLowerCase();
     const cleanQ = rawQ.replace(/^(pi|batch|order|job|sfo|ob|po|wo)\s*[-#.:/]*\s*/i, "").trim();
+
+    // If query is a pure small number (e.g. '1', '2', '15'), do not substring-match in larger numbers
+    const numQ = parseInt(cleanQ, 10);
+    const isSmallPureNum = !isNaN(numQ) && String(numQ) === cleanQ && cleanQ.length < 3;
 
     const pi = String(item.piNumber || item.piId || item.id || "").trim().toLowerCase();
     const batch = String(item.batchNo || "").trim().toLowerCase();
@@ -694,10 +699,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
     const checkMatch = (val: string) => {
       if (!val || val === "-" || val === "—") return false;
+      if (isSmallPureNum) {
+        return val === rawQ || val === cleanQ;
+      }
       return val.includes(rawQ) || (cleanQ.length > 0 && val.includes(cleanQ));
     };
 
-    return (
+    if (
       checkMatch(pi) ||
       checkMatch(batch) ||
       checkMatch(batchFmt) ||
@@ -710,60 +718,83 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       checkMatch(customer) ||
       checkMatch(project) ||
       checkMatch(fileName)
-    );
+    ) {
+      return true;
+    }
+
+    // Check item-level identifiers
+    const serial = String(item.serialNumber || "").trim().toLowerCase();
+    const barcode = String(item.barcode || "").trim().toLowerCase();
+    const qrId = String(item.qrId || "").trim().toLowerCase();
+    const itemCode = String(item.itemCode || item.glassCode || "").trim().toLowerCase();
+    const glassType = String(item.glassType || item.glassDescription || "").trim().toLowerCase();
+    const posNoStr = String(item.posNo || "").trim().toLowerCase();
+    const srNoStr = item.srNo !== undefined && item.srNo !== null ? String(item.srNo).trim().toLowerCase() : "";
+
+    if (isSmallPureNum) {
+      if (posNoStr === rawQ || posNoStr === cleanQ) return true;
+      if (srNoStr === rawQ || srNoStr === cleanQ) return true;
+      return false;
+    }
+
+    if (serial && (serial.includes(rawQ) || (cleanQ.length > 0 && serial.includes(cleanQ)))) return true;
+    if (barcode && (barcode.includes(rawQ) || (cleanQ.length > 0 && barcode.includes(cleanQ)))) return true;
+    if (qrId && (qrId.includes(rawQ) || (cleanQ.length > 0 && qrId.includes(cleanQ)))) return true;
+    if (itemCode && (itemCode.includes(rawQ) || (cleanQ.length > 0 && itemCode.includes(cleanQ)))) return true;
+    if (glassType && (glassType.includes(rawQ) || (cleanQ.length > 0 && glassType.includes(cleanQ)))) return true;
+
+    return false;
   };
 
-  // Strict matching for Position Number ONLY
+  // Strict & flexible matching for Position Number, Sticker Serial, Barcode, Glass Specs
   const matchStrictPos = (item: any, query: string): boolean => {
     if (!query || !query.trim()) return true;
     const rawQ = query.trim().toLowerCase();
-    const cleanQ = rawQ.replace(/^(pos|position|sr|sl|pos#|pos\.?|sr#|sl#)\s*[-#.:/]*\s*/i, "").trim();
+    const cleanQ = rawQ.replace(/^(position|pos#|pos\.?|pos\b|sr#|sr\b|sl#|sl\b)\s*[-#.:/]*\s*/i, "").trim();
 
     // 1. Direct item position fields
     const posNoStr = String(item.posNo || "").trim().toLowerCase();
-    const cleanPosNo = posNoStr.replace(/^(pos|position|sr|sl)\s*[-#.:/]*\s*/i, "").trim();
+    const cleanPosNo = posNoStr.replace(/^(position|pos#|pos\.?|pos\b|sr#|sr\b|sl#|sl\b)\s*[-#.:/]*\s*/i, "").trim();
     const srNoStr = item.srNo !== undefined && item.srNo !== null ? String(item.srNo).trim().toLowerCase() : "";
 
     // Exact string match on position (e.g. "1" === "1", "POS 1" === "pos 1", etc.)
     if (posNoStr && (posNoStr === rawQ || posNoStr === cleanQ)) return true;
     if (cleanPosNo && (cleanPosNo === rawQ || cleanPosNo === cleanQ)) return true;
 
-    // Number-equivalent match (e.g. "01" vs "1", "001" vs "1", "1.0" vs "1")
+    // Number-equivalent match (e.g. "01" vs "1", "001" vs "1", "1" vs "1")
     const numQ = parseInt(cleanQ, 10);
-    if (!isNaN(numQ)) {
+    if (!isNaN(numQ) && String(numQ) === cleanQ) {
       const numPos = parseInt(cleanPosNo, 10);
       if (!isNaN(numPos) && numPos === numQ) return true;
       if (srNoStr) {
         const numSr = parseInt(srNoStr, 10);
         if (!isNaN(numSr) && numSr === numQ) return true;
       }
+      // If it is just a pure short number (e.g. '1', '2', '15'), ONLY match pos/sr
+      // to avoid matching '1' inside arbitrary glass codes or dimensions
+      if (cleanQ.length < 4) {
+        return false;
+      }
     }
 
     if (srNoStr && (srNoStr === rawQ || srNoStr === cleanQ)) return true;
 
-    // 2. Exact sticker serial or barcode match ONLY (if user enters a specific full serial or barcode)
+    // 2. Barcode, Serial Number, and QR ID (full or substring match)
     const serial = String(item.serialNumber || "").trim().toLowerCase();
     const barcode = String(item.barcode || "").trim().toLowerCase();
     const qrId = String(item.qrId || "").trim().toLowerCase();
 
+    if (serial && (serial === rawQ || serial === cleanQ || (cleanQ.length >= 2 && serial.includes(cleanQ)))) return true;
+    if (barcode && (barcode === rawQ || barcode === cleanQ || (cleanQ.length >= 4 && barcode.includes(cleanQ)))) return true;
+    if (qrId && (qrId.includes(rawQ) || (cleanQ.length >= 4 && qrId.includes(cleanQ)))) return true;
+
     // 3. Glass Code, Description and Size Search
     const code = String(item.glassCode || item.itemCode || "").trim().toLowerCase();
-    const glassType = String(item.glassType || "").trim().toLowerCase();
+    const glassType = String(item.glassType || item.glassDescription || "").trim().toLowerCase();
     const dim = item.width && item.height ? `${item.width}x${item.height}` : "";
-    if (code && code.includes(rawQ)) return true;
-    if (glassType && glassType.includes(rawQ)) return true;
+    if (code && (code.includes(rawQ) || (cleanQ.length > 0 && code.includes(cleanQ)))) return true;
+    if (glassType && (glassType.includes(rawQ) || (cleanQ.length > 0 && glassType.includes(cleanQ)))) return true;
     if (dim && (dim.includes(cleanQ) || `${item.width}*${item.height}`.includes(cleanQ))) return true;
-
-    // Never use substring .includes() because '1' would match almost every barcode!
-    if (serial && (serial === rawQ || serial === cleanQ)) return true;
-    if (barcode && (barcode === rawQ || barcode === cleanQ)) return true;
-    if (qrId && (qrId === rawQ || qrId === cleanQ)) return true;
-
-    // Only allow prefix match if the entered query is long enough (at least 6 characters, e.g. "101262")
-    if (cleanQ.length >= 6) {
-      if (serial && serial.startsWith(cleanQ)) return true;
-      if (barcode && barcode.startsWith(cleanQ)) return true;
-    }
 
     return false;
   };
@@ -779,20 +810,21 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       stage?: string;
     }
   ) => {
-    // 1. Strictly check PI / Batch filter
+    // 1. Strictly check PI / Batch / Identifier filter
     if (searchPi.trim()) {
-      if (!matchStrictPi(item, searchPi)) {
+      if (!matchStrictPi(item, searchPi) && !matchStrictPos(item, searchPi)) {
         return false;
       }
     }
 
-    // 2. Strictly check Pos / Position filter
+    // 2. Strictly check Pos / Position / Barcode filter
     if (searchPos.trim()) {
       const matchItemPos = matchStrictPos(item, searchPos);
+      const matchItemPi = matchStrictPi(item, searchPos);
       const matchDefectSerial =
         extraFields?.defectivePane &&
         matchStrictPos({ serialNumber: extraFields.defectivePane } as any, searchPos);
-      if (!matchItemPos && !matchDefectSerial) {
+      if (!matchItemPos && !matchItemPi && !matchDefectSerial) {
         return false;
       }
     }
@@ -812,21 +844,36 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const filteredPis = useMemo(() => {
     if (!reportData?.pis) return [];
     return reportData.pis.filter((pi) => {
-      // 1. Strict PI filter
-      if (searchPi.trim() && !matchStrictPi(pi, searchPi)) {
-        return false;
+      // 1. PI / Batch / Item Identifier filter
+      if (searchPi.trim()) {
+        const directPiMatch = matchStrictPi(pi, searchPi);
+        if (!directPiMatch) {
+          const hasMatchingItem = (reportData.items || []).some(
+            (item) =>
+              (item.piNumber === pi.piNumber ||
+                item.piId === pi.id ||
+                item.piNumber === pi.id ||
+                item.batchNo === pi.batchNo ||
+                (item as any).orderNo === pi.piNumber ||
+                (item as any).orderNo === (pi as any).orderNo ||
+                (item.batchNo && (pi as any).batchNo && item.batchNo === (pi as any).batchNo)) &&
+              (matchStrictPi(item, searchPi) || matchStrictPos(item, searchPi))
+          );
+          if (!hasMatchingItem) return false;
+        }
       }
-      // 2. Strict Pos filter: check if any item in this PI matches the position number
+      // 2. Pos / Barcode filter: check if any item in this PI matches the query
       if (searchPos.trim()) {
         const hasMatchingPosItem = (reportData.items || []).some(
           (item) =>
             (item.piNumber === pi.piNumber ||
               item.piId === pi.id ||
               item.piNumber === pi.id ||
+              item.batchNo === pi.batchNo ||
               (item as any).orderNo === pi.piNumber ||
               (item as any).orderNo === (pi as any).orderNo ||
               (item.batchNo && (pi as any).batchNo && item.batchNo === (pi as any).batchNo)) &&
-            matchStrictPos(item, searchPos)
+            (matchStrictPos(item, searchPos) || matchStrictPi(item, searchPos))
         );
         if (!hasMatchingPosItem) return false;
       }
@@ -875,18 +922,24 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       const cust = getCustomerNameForItem(h.piNumber || h.itemOrBatch);
       if (selectedCustomer !== "all" && cust !== selectedCustomer) return false;
 
-      // 1. Strict PI filter
+      // 1. Strict & flexible PI / Batch / Identifier filter
       if (searchPi.trim()) {
-        const itemMock = {
+        const matchedItem = (reportData?.items || []).find(
+          (i) => (h.serialNumber && i.serialNumber === h.serialNumber) || (h.itemId && i.id === h.itemId)
+        );
+        const itemMock = matchedItem || {
           piNumber: h.piNumber,
           piId: h.piNumber,
           orderNo: h.itemOrBatch,
           batchNo: h.piNumber,
+          serialNumber: h.serialNumber,
+          barcode: h.barcode || h.serialNumber,
+          itemCode: h.itemOrBatch,
         };
-        if (!matchStrictPi(itemMock, searchPi)) return false;
+        if (!matchStrictPi(itemMock, searchPi) && !matchStrictPos(itemMock, searchPi)) return false;
       }
 
-      // 2. Strict Position filter
+      // 2. Strict & flexible Position / Barcode filter
       if (searchPos.trim()) {
         const matchedItem = (reportData?.items || []).find(
           (i) => (h.serialNumber && i.serialNumber === h.serialNumber) || (h.itemId && i.id === h.itemId)
@@ -895,8 +948,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
           serialNumber: h.serialNumber,
           barcode: h.barcode || h.serialNumber,
           posNo: h.itemOrBatch,
+          piNumber: h.piNumber,
+          batchNo: h.piNumber,
         };
-        if (!matchStrictPos(itemMock, searchPos)) return false;
+        if (!matchStrictPos(itemMock, searchPos) && !matchStrictPi(itemMock, searchPos)) return false;
       }
 
       // 3. Finish filter
@@ -1389,6 +1444,39 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     rejectsFilterMode !== "all" ||
     reworksFilterMode !== "all";
 
+  const handleManualSearch = () => {
+    const q1 = searchPi.trim();
+    const q2 = searchPos.trim();
+    if (!q1 && !q2) {
+      toast.info("Type a Batch #, PI #, POS #, or Barcode to filter records");
+      return;
+    }
+    let count = 0;
+    let label = "records";
+    if (activeTab === "pis") {
+      count = filteredPis.length;
+      label = count === 1 ? "batch" : "batches";
+    } else if (activeTab === "items") {
+      count = filteredItems.length;
+      label = count === 1 ? "glass item" : "glass items";
+    } else if (activeTab === "history") {
+      count = filteredHistory.length;
+      label = count === 1 ? "audit log" : "audit logs";
+    } else if (activeTab === "rejects") {
+      count = totalRejectsInFilter;
+      label = count === 1 ? "rejected item" : "rejected items";
+    } else if (activeTab === "reworks") {
+      count = totalReworksInFilter;
+      label = count === 1 ? "rework item" : "rework items";
+    }
+
+    if (count > 0) {
+      toast.success(`Found ${count} matching ${label}`);
+    } else {
+      toast.warning(`No ${label} matched "${q1 || q2}" in this view`);
+    }
+  };
+
   if (loading) {
     return (
       <div className="py-20 flex flex-col items-center justify-center space-y-4">
@@ -1846,12 +1934,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               <div className="flex items-center gap-2 flex-1 min-w-[320px] max-w-xl">
                 {/* 1. PI / Batch Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500" />
+                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search PI # / Batch #..."
                     value={searchPi}
                     onChange={(e) => setSearchPi(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPi && (
@@ -1868,12 +1959,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                 {/* 2. Position # / Sticker Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500" />
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search Position # (e.g. 1, 2)..."
                     value={searchPos}
                     onChange={(e) => setSearchPos(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPos && (
@@ -1892,11 +1986,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   type="button"
                   size="sm"
                   variant="default"
-                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0"
+                  onClick={handleManualSearch}
+                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-transform active:scale-95"
                 >
                   <Search className="w-3.5 h-3.5" />
                   <span>Search</span>
                 </Button>
+
+                {(searchPi || searchPos) && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setSearchPi("");
+                      setSearchPos("");
+                    }}
+                    className="h-8 px-2 text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-lg gap-1 shrink-0"
+                    title="Reset search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Clear</span>
+                  </Button>
+                )}
               </div>
 
               {/* Finish Filter: All / Colour / Clear */}
@@ -2034,12 +2146,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               <div className="flex items-center gap-2 flex-1 min-w-[320px] max-w-xl">
                 {/* 1. PI / Batch Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500" />
+                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search PI # / Batch #..."
                     value={searchPi}
                     onChange={(e) => setSearchPi(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPi && (
@@ -2056,12 +2171,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                 {/* 2. Position # / Sticker Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500" />
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search Position # (e.g. 1, 2)..."
                     value={searchPos}
                     onChange={(e) => setSearchPos(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPos && (
@@ -2080,11 +2198,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   type="button"
                   size="sm"
                   variant="default"
-                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0"
+                  onClick={handleManualSearch}
+                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-transform active:scale-95"
                 >
                   <Search className="w-3.5 h-3.5" />
                   <span>Search</span>
                 </Button>
+
+                {(searchPi || searchPos) && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setSearchPi("");
+                      setSearchPos("");
+                    }}
+                    className="h-8 px-2 text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-lg gap-1 shrink-0"
+                    title="Reset search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Clear</span>
+                  </Button>
+                )}
               </div>
 
               {/* Finish Filter: All / Colour / Clear */}
@@ -2326,12 +2462,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               <div className="flex items-center gap-2 flex-1 min-w-[320px] max-w-xl">
                 {/* 1. PI / Batch Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500" />
+                  <FileText className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-blue-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search PI # / Batch #..."
                     value={searchPi}
                     onChange={(e) => setSearchPi(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPi && (
@@ -2348,12 +2487,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                 {/* 2. Position # / Sticker Search Input */}
                 <div className="relative flex-1 min-w-[140px]">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500" />
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-purple-500 pointer-events-none" />
                   <Input
                     type="text"
                     placeholder="Search Position # (e.g. 1, 2)..."
                     value={searchPos}
                     onChange={(e) => setSearchPos(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-white focus:bg-white rounded-lg"
                   />
                   {searchPos && (
@@ -2372,11 +2514,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   type="button"
                   size="sm"
                   variant="default"
-                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0"
+                  onClick={handleManualSearch}
+                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-transform active:scale-95"
                 >
                   <Search className="w-3.5 h-3.5" />
                   <span>Search</span>
                 </Button>
+
+                {(searchPi || searchPos) && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      setSearchPi("");
+                      setSearchPos("");
+                    }}
+                    className="h-8 px-2 text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 rounded-lg gap-1 shrink-0"
+                    title="Reset search"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Clear</span>
+                  </Button>
+                )}
               </div>
 
               {/* Finish Filter: All / Colour / Clear */}
@@ -2673,6 +2833,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     placeholder="Search PI # / Batch # (e.g. 5442, SFO-9281)..."
                     value={searchPi}
                     onChange={(e) => setSearchPi(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-slate-50/60 focus:bg-white rounded-lg w-full"
                   />
                   {searchPi && (
@@ -2695,6 +2858,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     placeholder="Search Position # or Barcode (e.g. 1, 2, SEJ-012)..."
                     value={searchPos}
                     onChange={(e) => setSearchPos(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-slate-50/60 focus:bg-white rounded-lg w-full"
                   />
                   {searchPos && (
@@ -2708,6 +2874,17 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     </button>
                   )}
                 </div>
+
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="default"
+                  onClick={handleManualSearch}
+                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-transform active:scale-95"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  <span>Search</span>
+                </Button>
 
                 {(searchPi || searchPos) && (
                   <Button
@@ -3380,6 +3557,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     placeholder="Search PI # / Batch # (e.g. 5442, SFO-9281)..."
                     value={searchPi}
                     onChange={(e) => setSearchPi(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-slate-50/60 focus:bg-white rounded-lg w-full"
                   />
                   {searchPi && (
@@ -3402,6 +3582,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     placeholder="Search Position # or Barcode (e.g. 1, 2, SEJ-012)..."
                     value={searchPos}
                     onChange={(e) => setSearchPos(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleManualSearch();
+                    }}
                     className="pl-8 pr-7 h-8 text-xs font-medium border-slate-200 bg-slate-50/60 focus:bg-white rounded-lg w-full"
                   />
                   {searchPos && (
@@ -3415,6 +3598,17 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     </button>
                   )}
                 </div>
+
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="default"
+                  onClick={handleManualSearch}
+                  className="h-8 px-3 text-xs font-bold bg-gradient-to-r from-indigo-500 to-indigo-700 hover:bg-indigo-700 text-white rounded-lg shadow-2xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-transform active:scale-95"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  <span>Search</span>
+                </Button>
 
                 {(searchPi || searchPos) && (
                   <Button

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { cn, formatBatchNumber, getDistinctPiDisplay, isLaminatedGlass, isDguGlass, isDguStickerPairMatch, isLaminationStickerPairMatch, getItemFinish, getGlassPaneRole, parseRackInfo } from "./utils";
+import { cn, formatBatchNumber, getDistinctPiDisplay, isLaminatedGlass, isDguGlass, isDguStickerPairMatch, isLaminationStickerPairMatch, getItemFinish, getGlassPaneRole, parseRackInfo, isItemInPackingStage, isItemInFinishedStage, isItemCompleted } from "./utils";
 
 describe("cn function", () => {
   it("should merge classes correctly", () => {
@@ -364,6 +364,94 @@ describe("parseRackInfo", () => {
     expect(parseRackInfo("Rack D - 12")).toEqual({ rackNo: "Rack D", rackSlot: "12" });
     expect(parseRackInfo("Rack E")).toEqual({ rackNo: "Rack E", rackSlot: "" });
     expect(parseRackInfo("Direct Finish")).toEqual({ rackNo: "Direct Finish", rackSlot: "—" });
+  });
+});
+
+describe("Finished vs Packing Stage Classification & Completion Rules", () => {
+  it("should treat glass pending in IGU packing list as packing and NOT completed", () => {
+    const dguPackingItem = {
+      id: "item-6306-1",
+      serialNumber: "S001",
+      piNumber: "6306",
+      glassCategory: "DGU" as const,
+      currentStage: "Finished",
+      completedStages: ["Cutting", "Pairing", "DGU"],
+      status: "Completed", // Even if legacy backend marked status Completed
+      sentToFinished: false,
+    };
+
+    expect(isItemInPackingStage(dguPackingItem)).toBe(true);
+    expect(isItemInFinishedStage(dguPackingItem)).toBe(false);
+    expect(isItemCompleted(dguPackingItem)).toBe(false);
+  });
+
+  it("should treat glass placed on a physical rack in packing list as packing and NOT completed", () => {
+    const rackedPackingItem = {
+      id: "item-6306-2",
+      serialNumber: "S002",
+      piNumber: "6306",
+      glassCategory: "DGU" as const,
+      currentStage: "Finished",
+      completedStages: ["Cutting", "Pairing", "DGU"],
+      packingRackNo: "Rack A - 25",
+      status: "In Production",
+      sentToFinished: false,
+    };
+
+    expect(isItemInPackingStage(rackedPackingItem)).toBe(true);
+    expect(isItemInFinishedStage(rackedPackingItem)).toBe(false);
+    expect(isItemCompleted(rackedPackingItem)).toBe(false);
+  });
+
+  it("should treat glass as finished and completed only when sentToFinished is true", () => {
+    const sentFinishedItem = {
+      id: "item-6306-3",
+      serialNumber: "S003",
+      piNumber: "6306",
+      glassCategory: "DGU" as const,
+      currentStage: "Finished",
+      completedStages: ["Cutting", "Pairing", "DGU", "Finished"],
+      packingRackNo: "Rack A - 25",
+      sentToFinished: true,
+      status: "Completed",
+    };
+
+    expect(isItemInPackingStage(sentFinishedItem)).toBe(false);
+    expect(isItemInFinishedStage(sentFinishedItem)).toBe(true);
+    expect(isItemCompleted(sentFinishedItem)).toBe(true);
+  });
+
+  it("should treat glass as finished and completed when assigned Direct Finish", () => {
+    const directFinishItem = {
+      id: "item-6306-4",
+      serialNumber: "S004",
+      piNumber: "6306",
+      glassCategory: "DGU" as const,
+      currentStage: "Finished",
+      completedStages: ["Cutting", "Pairing", "DGU"],
+      packingRackNo: "Direct Finish",
+      status: "Completed",
+    };
+
+    expect(isItemInPackingStage(directFinishItem)).toBe(false);
+    expect(isItemInFinishedStage(directFinishItem)).toBe(true);
+    expect(isItemCompleted(directFinishItem)).toBe(true);
+  });
+
+  it("should treat monolithic glass at Finished stage as finished and completed", () => {
+    const monoItem = {
+      id: "item-mono-1",
+      serialNumber: "S005",
+      piNumber: "1001",
+      glassType: "12MM CLEAR TEMPERED",
+      currentStage: "Finished",
+      completedStages: ["Cutting", "Polishing"],
+      status: "Completed",
+    };
+
+    expect(isItemInPackingStage(monoItem)).toBe(false);
+    expect(isItemInFinishedStage(monoItem)).toBe(true);
+    expect(isItemCompleted(monoItem)).toBe(true);
   });
 });
 

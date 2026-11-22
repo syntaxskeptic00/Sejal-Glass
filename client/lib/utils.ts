@@ -698,18 +698,30 @@ export function isItemInPackingStage(i: any): boolean {
 }
 
 /**
- * Checks whether an item has completed packing (placed on a rack or sent to finished) and is in Finished Glass stage
+ * Checks whether an item has genuinely arrived in Finished Glass stage (sent from packing or Direct Finish or monolithic)
  */
 export function isItemInFinishedStage(i: any): boolean {
   if (!i || isDispatchedItem(i) || i.status === "Rejected") return false;
+  // If currently pending or racked in packing stage (IGU or Auto Clave), it is in Packing, NOT Finished!
+  if (isItemInPackingStage(i)) return false;
   // If explicitly sent to finished or history
   if (Boolean(i.sentToFinished)) return true;
   // If direct finish
   if (i.packingRackNo && parseRackInfo(i.packingRackNo).rackNo === "Direct Finish") return true;
-  // Any unit placed on a physical rack (e.g. "Rack A - 25", "Rack C - 10") is in Finished Glass stage!
-  if (Boolean(i.packingRackNo && i.packingRackNo.trim())) return true;
-  // Monolithic glass that reached Finished stage directly
+  // Monolithic glass that reached Finished stage directly (never goes through packing)
   if (i.currentStage === "Finished" && !isDguGlass(i) && !isDlguGlass(i) && !isLaminatedGlass(i)) return true;
+  return false;
+}
+
+/**
+ * Checks whether an item is considered Completed:
+ * Only glass which has genuinely reached the Finished stage or has been Dispatched is considered Completed!
+ * Glass in packing stages (IGU Packing List or Auto Clave Packing List) is in WIP packing, NEVER completed.
+ */
+export function isItemCompleted(i: any): boolean {
+  if (!i || i.status === "Rejected" || (i as any).isRejected) return false;
+  if (isItemInPackingStage(i)) return false;
+  if (isDispatchedItem(i) || isItemInFinishedStage(i)) return true;
   return false;
 }
 

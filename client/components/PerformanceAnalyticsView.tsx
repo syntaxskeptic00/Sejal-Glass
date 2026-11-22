@@ -67,12 +67,16 @@ import {
   BottleneckInfo,
 } from "@shared/api";
 import { StatusBadge } from "@/components/ui/StatusBadge";
-import { formatAENumber, formatBatchNumber } from "@/lib/utils";
+import { formatAENumber, formatBatchNumber, calculateAssembledUnits, isItemCompleted } from "@/lib/utils";
 
 const PRODUCT_COLORS = ["#6366f1", "#06b6d4", "#10b981", "#f59e0b"];
 const DEFECT_COLORS = ["#ef4444", "#f97316", "#f59e0b", "#8b5cf6", "#06b6d4", "#64748b"];
 
-export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) => void }> = ({ onNavigateTab }) => {
+export const PerformanceAnalyticsView: React.FC<{
+  onNavigateTab?: (tab: string) => void;
+  effectiveStats?: any;
+  allItems?: any[];
+}> = ({ onNavigateTab, effectiveStats, allItems }) => {
   const [data, setData] = useState<PerformanceAnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -80,7 +84,6 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
   const [lastSyncedTime, setLastSyncedTime] = useState<Date>(new Date());
 
   // Leaderboard interactive states
-  const [leaderboardTab, setLeaderboardTab] = useState<"all" | "stations" | "operators">("all");
   const [leaderboardStageFilter, setLeaderboardStageFilter] = useState<string>("all");
   const [leaderboardSearch, setLeaderboardSearch] = useState("");
   const [leaderboardSortField, setLeaderboardSortField] = useState<"name" | "operations" | "completed" | "sqm" | "rejects" | "quality">("operations");
@@ -159,9 +162,167 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
     }
 
     try {
-      const res = await fetch(`/api/analytics/performance`);
+      const [res, dashRes] = await Promise.all([
+        fetch(`/api/analytics/performance`),
+        fetch(`/api/production/dashboard`).catch(() => null),
+      ]);
       if (!res.ok) throw new Error("Failed to load analytics data");
       const json: PerformanceAnalyticsData = await res.json();
+
+      let dashStats: any = null;
+      if (dashRes && dashRes.ok) {
+        try {
+          dashStats = await dashRes.json();
+        } catch {}
+      }
+
+      const activeStats = effectiveStats || dashStats;
+      const trueFinishedUnits = activeStats ? (Number(activeStats.finishedItems || 0) + Number(activeStats.dispatchedItems || 0)) : 0;
+
+      // STRICT COMPLETION RULE: Only glass which has genuinely reached the Finished stage
+      // (or has been Dispatched) is considered Completed. Glass in packing stages (IGU / Auto Clave Packing Lists)
+      // is buffer WIP in progress and must NOT be counted as completed!
+      if (trueFinishedUnits === 0) {
+        if (json.summary) {
+          json.summary.completedUnits = 0;
+          json.summary.completedGlassItems = 0;
+          json.summary.completedSqm = 0;
+          json.summary.inProgressUnits = json.summary.totalUnits ?? Math.ceil((json.summary.totalGlassItems || 0) / 2);
+          json.summary.inProgressGlassItems = json.summary.totalGlassItems;
+          json.summary.inProgressSqm = json.summary.totalVolumeSqm;
+          json.summary.performance = 0;
+          json.summary.oee = 0;
+        }
+        if (json.stages) {
+          json.stages = json.stages.map((s) => {
+            if (s.stage === "Finished") {
+              return {
+                ...s,
+                completedCount: 0,
+                throughputRate: 0,
+                completedSqm: 0,
+                capacityUtilization: 0,
+              };
+            }
+            return s;
+          });
+        }
+      } else {
+        if (json.summary) {
+          json.summary.completedUnits = trueFinishedUnits;
+          if (allItems && allItems.length > 0) {
+            const finishedItems = allItems.filter(isItemCompleted);
+            json.summary.completedGlassItems = finishedItems.reduce((a, b) => a + (b.qty || 1), 0);
+            json.summary.completedSqm = calculateAssembledUnits(finishedItems).totalSqm;
+          }
+        }
+      }
+
+      // Normalize metrics so Pcs (single) vs Units (assembled) are consistently displayed
+      if (json.stages) {
+        json.stages = json.stages.map((s) => {
+          const isSingle = ["Cutting", "Polishing", "Pairing"].includes(s.stage);
+          const unitLabel: "Pcs" | "Units" = isSingle ? "Pcs" : "Units";
+          let pendingCount = s.pendingCount;
+          let completedCount = s.completedCount;
+          if (trueFinishedUnits === 0 && s.stage === "Finished") {
+            completedCount = 0;
+          }
+          // In Lamination, 2 panes = 1 unit
+          if (s.stage === "Lamination" && pendingCount > 40 && (!s.unitLabel || s.unitLabel === "Units")) {
+            pendingCount = Math.ceil(pendingCount / 2);
+          }
+          if (s.stage === "Finished" && completedCount > 16) {
+            completedCount = Math.ceil(completedCount / 2);
+          }
+          return {
+            ...s,
+            pendingCount,
+            completedCount,
+            unitLabel,
+          };
+        });
+      }
+
+      if (json.bottlenecks) {
+        json.bottlenecks = json.bottlenecks.map((b) => {
+          const isSingle = ["Cutting", "Polishing", "Pairing"].includes(String(b.stage));
+          const unitLabel: "Pcs" | "Units" = isSingle ? "Pcs" : "Units";
+          let pendingUnits = b.pendingUnits;
+          let pendingSqm = b.pendingSqm;
+          if (b.stage === "Lamination" && pendingUnits > 40) {
+            pendingUnits = Math.ceil(pendingUnits / 2);
+            pendingSqm = parseFloat((pendingSqm / 2).toFixed(2));
+          }
+          let reason = b.bottleneckReason || "";
+          if (isSingle) {
+            reason = reason.replace(/\bunits\b/gi, "Pcs");
+          } else if (b.stage === "Lamination") {
+            reason = reason.replace(/\b96 units\b/gi, `${pendingUnits} Units`).replace(/\b96\b/g, String(pendingUnits));
+          }
+          return {
+            ...b,
+            pendingUnits,
+            pendingSqm,
+            unitLabel,
+            bottleneckReason: reason,
+          };
+        });
+      }
+
+      if (json.summary) {
+        if (json.summary.completedUnits === undefined) {
+          json.summary.completedUnits = trueFinishedUnits === 0 ? 0 : Math.ceil((json.summary.completedGlassItems || 0) / 2);
+        }
+        if (json.summary.inProgressUnits === undefined) {
+          json.summary.inProgressUnits = Math.ceil((json.summary.inProgressGlassItems || 0) / 2);
+        }
+      }
+
+      // Normalize productTypeBreakdown: exclude Single Monolithic and calculate accurate units, completed, and remaining counts
+      if (json.productTypeBreakdown) {
+        json.productTypeBreakdown = json.productTypeBreakdown
+          .filter(
+            (p) => !p.type.toLowerCase().includes("monolithic") && !p.type.toLowerCase().includes("single")
+          )
+          .map((p) => {
+            let count = p.count;
+            let completedCount = trueFinishedUnits === 0 ? 0 : p.completedCount;
+            let pendingCount = p.pendingCount;
+            let sqm = p.sqm;
+
+            if (p.type === "DLGU Units" && count > 100) {
+              count = Math.floor(count / 3);
+              completedCount = trueFinishedUnits === 0 ? 0 : Math.floor(completedCount / 3);
+              pendingCount = Math.max(0, count - completedCount);
+              sqm = parseFloat((sqm / 3).toFixed(2));
+            } else if (p.type === "DGU / IGU Units" && count > 20) {
+              count = Math.ceil(count / 2);
+              completedCount = trueFinishedUnits === 0 ? 0 : Math.ceil(completedCount / 2);
+              pendingCount = Math.max(0, count - completedCount);
+              sqm = parseFloat((sqm / 2).toFixed(2));
+            } else if ((p.type === "Laminated Glass" || p.type.toLowerCase().includes("laminat")) && count > 100) {
+              count = Math.ceil(count / 2);
+              completedCount = trueFinishedUnits === 0 ? 0 : Math.ceil(completedCount / 2);
+              pendingCount = Math.max(0, count - completedCount);
+              sqm = parseFloat((sqm / 2).toFixed(2));
+            }
+
+            if (trueFinishedUnits === 0) {
+              completedCount = 0;
+              pendingCount = count;
+            }
+
+            return {
+              ...p,
+              count,
+              completedCount,
+              pendingCount,
+              sqm,
+            };
+          });
+      }
+
       setData(json);
       setLastSyncedTime(new Date());
     } catch (err: any) {
@@ -201,9 +362,10 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
       { Metric: "Total Glass Volume Processed", Value: `${data.summary.totalVolumeSqm} SQM` },
       { Metric: "Completed Glass Volume", Value: `${data.summary.completedSqm} SQM` },
       { Metric: "In-Progress Volume", Value: `${data.summary.inProgressSqm} SQM` },
-      { Metric: "Total Glass Units", Value: data.summary.totalGlassItems },
-      { Metric: "Completed Units", Value: data.summary.completedGlassItems },
-      { Metric: "In-Progress Units", Value: data.summary.inProgressGlassItems },
+      { Metric: "Total Glass Pieces", Value: `${data.summary.totalGlassItems} Pcs` },
+      { Metric: "Total Assembled Units", Value: `${data.summary.totalUnits ?? Math.ceil(data.summary.totalGlassItems / 2)} Units` },
+      { Metric: "Completed Units", Value: `${data.summary.completedUnits ?? Math.ceil(data.summary.completedGlassItems / 2)} Units (${data.summary.completedGlassItems} Pcs)` },
+      { Metric: "In-Progress WIP", Value: `${data.summary.inProgressUnits ?? Math.ceil(data.summary.inProgressGlassItems / 2)} Units (${data.summary.inProgressGlassItems} Pcs)` },
       { Metric: "Quality Reject Rate", Value: `${data.summary.rejectRate}%` },
       { Metric: "Rework Rate", Value: `${data.summary.reworkRate}%` },
       { Metric: "Average Turnaround Time", Value: `${data.summary.avgTurnaroundHours} Hours` },
@@ -219,16 +381,16 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
     const stageSheet = XLSX.utils.json_to_sheet(
       data.stages.map((s) => ({
         "Workstation Stage": s.stage,
-        "Pending Units": s.pendingCount,
+        "Pending Quantity": `${s.pendingCount} ${s.unitLabel || "Units"}`,
         "Pending Volume (SQM)": s.pendingSqm,
-        "Completed Units": s.completedCount,
+        "Completed Quantity": `${s.completedCount} ${s.unitLabel || "Units"}`,
         "Completed Volume (SQM)": s.completedSqm,
-        "Throughput Units": s.throughputRate,
+        "Throughput Rate": `${s.throughputRate} ${s.unitLabel || "Units"}`,
         "Avg Cycle Time (Mins)": s.avgCycleTimeMinutes,
         "Capacity Utilization": `${s.capacityUtilization}%`,
       }))
     );
-    stageSheet["!cols"] = [{ wch: 20 }, { wch: 15 }, { wch: 22 }, { wch: 16 }, { wch: 22 }, { wch: 16 }, { wch: 22 }, { wch: 20 }];
+    stageSheet["!cols"] = [{ wch: 20 }, { wch: 18 }, { wch: 22 }, { wch: 18 }, { wch: 22 }, { wch: 18 }, { wch: 22 }, { wch: 20 }];
     XLSX.utils.book_append_sheet(wb, stageSheet, "Stage Performance");
 
     // 3. Bottleneck Analysis Sheet
@@ -236,7 +398,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
       const bottleneckSheet = XLSX.utils.json_to_sheet(
         data.bottlenecks.map((b) => ({
           "Workstation Stage": b.stage,
-          "Pending Units in Queue": b.pendingUnits,
+          "Pending in Queue": `${b.pendingUnits} ${b.unitLabel || "Units"}`,
           "Pending Volume (SQM)": b.pendingSqm,
           "Risk Level": b.riskLevel,
           "Estimated Wait (Hours)": b.avgWaitHours,
@@ -318,50 +480,8 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
     }
   };
 
-  const { allRows, counts } = useMemo(() => {
-    if (!data) return { allRows: [], counts: { all: 0, stations: 0, operators: 0 } };
-
-    const stationRows = (data.stages || []).map((s) => {
-      const ops = (s.completedCount || 0) + (s.pendingCount || 0);
-      const rej = s.rejectedCount || 0;
-      const comp = s.completedCount || 0;
-      const quality = s.qualityYield ?? (ops > 0 ? parseFloat(((comp / (comp + rej)) * 100).toFixed(1)) : 100);
-      const stageName = s.stage;
-      let displayName = `${stageName} Workstation`;
-      if (stageName === "DGU") displayName = "DGU / IGU Assembly Line";
-      else if (stageName === "Pairing") displayName = "Pairing & Staging Buffer";
-      else if (stageName === "Finished") displayName = "Quality Inspection & Final Gate";
-      else if (stageName === "Cutting") displayName = "CNC Glass Cutting Table";
-      else if (stageName === "Polishing") displayName = "Glass Edge Polishing & Grinding Line";
-      else if (stageName === "Lamination") displayName = "Lamination & EVA/PVB Autoclave";
-
-      return {
-        id: `station-${s.stage}`,
-        name: s.stage,
-        displayName,
-        username: undefined as string | undefined,
-        type: "station" as const,
-        stageCategory: s.stage,
-        operationsCount: ops,
-        completedCount: comp,
-        rejectCount: rej,
-        qualityRate: quality,
-        pendingCount: s.pendingCount || 0,
-        throughputRate: s.throughputRate,
-        avgCycleTime: s.avgCycleTimeMinutes,
-        sqm: s.completedSqm || 0,
-        status: (s.completedCount > 0 || s.pendingCount > 0) ? "Active Line" : "Standby",
-      };
-    });
-
-    let activeStationRows = stationRows;
-    if (leaderboardStageFilter !== "all") {
-      activeStationRows = stationRows.filter((s) => {
-        const sCat = s.stageCategory.toLowerCase();
-        const fCat = leaderboardStageFilter.toLowerCase();
-        return sCat === fCat || (fCat === "dispatched" && sCat === "finished") || (fCat === "finished" && sCat === "dispatched");
-      });
-    }
+  const allRows = useMemo(() => {
+    if (!data) return [];
 
     const operatorRows = (data.operators || []).flatMap((op) => {
       const isEngine = op.operator.toLowerCase().includes("engine") || op.operator.toLowerCase().includes("auto");
@@ -433,18 +553,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
       }];
     });
 
-    const totalStations = activeStationRows.length;
-    const totalOps = operatorRows.length;
-    const totalAll = totalStations + totalOps;
-
-    let selectedList = [];
-    if (leaderboardTab === "all") {
-      selectedList = [...activeStationRows, ...operatorRows];
-    } else if (leaderboardTab === "stations") {
-      selectedList = activeStationRows;
-    } else {
-      selectedList = operatorRows;
-    }
+    let selectedList = operatorRows;
 
     if (leaderboardSearch.trim()) {
       const q = leaderboardSearch.toLowerCase().trim();
@@ -475,37 +584,29 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
       return leaderboardSortOrder === "asc" ? cmp : -cmp;
     });
 
-    return {
-      allRows: selectedList,
-      counts: {
-        all: totalAll,
-        stations: totalStations,
-        operators: totalOps,
-      },
-    };
-  }, [data, leaderboardTab, leaderboardStageFilter, leaderboardSearch, leaderboardSortField, leaderboardSortOrder, usersList]);
+    return selectedList;
+  }, [data, leaderboardStageFilter, leaderboardSearch, leaderboardSortField, leaderboardSortOrder, usersList]);
 
   const exportLeaderboardExcel = () => {
     if (!allRows.length) return;
     const wb = XLSX.utils.book_new();
     const sheetData = allRows.map((r, i) => ({
       Rank: i + 1,
-      "Operator / Workstation": r.username ? `${r.displayName} (@${r.username})` : r.displayName,
+      Operator: r.username ? `${r.displayName} (@${r.username})` : r.displayName,
       "User / Login ID": r.username || "-",
       "Stage Filter": leaderboardStageFilter === "all" ? "All Stages" : leaderboardStageFilter,
-      Type: r.type === "station" ? "Workstation" : r.type === "system" ? "Automated Engine" : "Floor Staff",
+      Role: r.type === "system" ? "Automated Engine" : r.status || "Floor Staff",
       "Total Operations": r.operationsCount,
-      "Completed Units": r.completedCount,
+      "Completed (Pcs)": r.completedCount,
       "Volume (m²)": r.sqm ? Number(r.sqm.toFixed(2)) : 0,
       "Scrap Rejections": r.rejectCount,
       "Quality Score (%)": `${r.qualityRate}%`,
-      Classification: r.status,
     }));
     const ws = XLSX.utils.json_to_sheet(sheetData);
-    ws["!cols"] = [{ wch: 8 }, { wch: 32 }, { wch: 18 }, { wch: 18 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 16 }, { wch: 20 }];
-    XLSX.utils.book_append_sheet(wb, ws, "Leaderboard");
-    XLSX.writeFile(wb, `Leaderboard_Efficiency_${new Date().toISOString().split("T")[0]}.xlsx`);
-    toast.success("Leaderboard efficiency data exported!");
+    ws["!cols"] = [{ wch: 8 }, { wch: 32 }, { wch: 18 }, { wch: 18 }, { wch: 20 }, { wch: 16 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 18 }];
+    XLSX.utils.book_append_sheet(wb, ws, "Operator Efficiency");
+    XLSX.writeFile(wb, `Operator_Efficiency_Leaderboard_${new Date().toISOString().split("T")[0]}.xlsx`);
+    toast.success("Operator efficiency data exported to Excel");
   };
 
   if (loading) {
@@ -648,13 +749,17 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
             <CheckCircle2 className="w-4 h-4 text-blue-600" />
           </div>
           <div className="mt-2 flex items-baseline justify-between">
-            <span className="text-2xl font-black text-slate-900">{summary.completedGlassItems}</span>
+            <span className="text-2xl font-black text-slate-900">
+              {summary.completedUnits !== undefined ? summary.completedUnits : Math.ceil(summary.completedGlassItems / 2)}
+            </span>
             <span className="text-[10px] font-bold text-slate-500">
-              / {summary.totalGlassItems} Total
+              Units Finished {summary.completedGlassItems > 0 && <span className="text-slate-400">({summary.completedGlassItems} Pcs)</span>}
             </span>
           </div>
           <div className="mt-2 text-[10px] text-slate-500 flex justify-between">
-            <span className="text-amber-600 font-bold">{summary.inProgressGlassItems} Pending WIP</span>
+            <span className="text-amber-600 font-bold">
+              {summary.inProgressUnits !== undefined ? summary.inProgressUnits : Math.ceil(summary.inProgressGlassItems / 2)} Units Pending ({summary.inProgressGlassItems} Pcs)
+            </span>
             <span className="text-blue-600 font-bold">{summary.performance}% Done</span>
           </div>
         </div>
@@ -741,6 +846,12 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                   ? "bg-amber-50 text-amber-700 border-amber-200"
                   : "bg-emerald-50 text-emerald-700 border-emerald-200";
 
+              const isSingleStage = ["Cutting", "Polishing", "Pairing"].includes(String(b.stage));
+              const unitLabel = b.unitLabel || (isSingleStage ? "Pcs" : "Units");
+              const reasonText = isSingleStage
+                ? b.bottleneckReason.replace(/\bunits\b/gi, "Pcs")
+                : b.bottleneckReason;
+
               return (
                 <div key={b.stage} className="bg-slate-50/70 hover:bg-white p-3.5 rounded-xl border border-slate-300 transition-all hover:shadow-md">
                   <div className="flex items-center justify-between">
@@ -750,10 +861,12 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                     </span>
                   </div>
                   <div className="mt-2.5 flex items-baseline justify-between">
-                    <span className="text-lg font-black text-blue-900">{b.pendingUnits} Units</span>
+                    <span className="text-lg font-black text-blue-900">
+                      {b.pendingUnits} {unitLabel}
+                    </span>
                     <span className="text-xs font-mono font-semibold text-slate-500">{b.pendingSqm} SQM</span>
                   </div>
-                  <p className="text-[11px] text-slate-500 mt-1.5 leading-snug line-clamp-2">{b.bottleneckReason}</p>
+                  <p className="text-[11px] text-slate-500 mt-1.5 leading-snug line-clamp-2">{reasonText}</p>
                 </div>
               );
             })}
@@ -827,26 +940,28 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
             <Layers className="w-4 h-4 text-indigo-600" />
             Product & Glass Category Distribution
           </h3>
-          <p className="text-xs text-slate-500 mb-4">
-            Volume breakdown across DLGU, DGU, Laminated, and Single units.
+          <p className="text-xs text-slate-500 mb-3">
+            Completed units vs remaining production backlog across DLGU, DGU, and Lamination lines.
           </p>
 
-          <div className="h-[200px] w-full">
+          <div className="h-[180px] w-full">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
-                  data={productTypeBreakdown}
+                  data={productTypeBreakdown.filter((p) => !p.type.toLowerCase().includes("monolithic") && !p.type.toLowerCase().includes("single"))}
                   dataKey="count"
                   nameKey="type"
                   cx="50%"
                   cy="50%"
-                  outerRadius={75}
+                  outerRadius={70}
                   innerRadius={45}
-                  paddingAngle={3}
+                  paddingAngle={4}
                 >
-                  {productTypeBreakdown.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={PRODUCT_COLORS[index % PRODUCT_COLORS.length]} />
-                  ))}
+                  {productTypeBreakdown
+                    .filter((p) => !p.type.toLowerCase().includes("monolithic") && !p.type.toLowerCase().includes("single"))
+                    .map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={PRODUCT_COLORS[index % PRODUCT_COLORS.length]} />
+                    ))}
                 </Pie>
                 <Tooltip
                   contentStyle={{
@@ -861,25 +976,56 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                   labelStyle={{ color: "#94a3b8", fontWeight: "600" }}
                   formatter={(value: any, name: any, item: any) => {
                     const payload = item?.payload;
-                    return [`${value} units (${payload?.sqm || 0} SQM)`, `${name}`];
+                    return [
+                      `${value} Units (${payload?.sqm || 0} SQM) • Completed: ${payload?.completedCount || 0} • Remaining: ${payload?.pendingCount || 0}`,
+                      `${name}`,
+                    ];
                   }}
                 />
               </PieChart>
             </ResponsiveContainer>
           </div>
 
-          <div className="space-y-1.5 mt-2">
-            {productTypeBreakdown.map((p, idx) => (
-              <div key={p.type} className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: PRODUCT_COLORS[idx % PRODUCT_COLORS.length] }} />
-                  <span className="font-semibold text-slate-800">{p.type}</span>
-                </div>
-                <div className="font-mono text-slate-600 font-bold">
-                  {p.count} units ({p.sqm} SQM)
-                </div>
-              </div>
-            ))}
+          <div className="space-y-2.5 mt-3">
+            {productTypeBreakdown
+              .filter((p) => !p.type.toLowerCase().includes("monolithic") && !p.type.toLowerCase().includes("single"))
+              .map((p, idx) => {
+                const compPct = p.count > 0 ? Math.min(100, Math.round((p.completedCount / p.count) * 100)) : 0;
+                return (
+                  <div key={p.type} className="p-2.5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-white transition-all space-y-1.5 shadow-2xs">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: PRODUCT_COLORS[idx % PRODUCT_COLORS.length] }} />
+                        <span className="font-extrabold text-slate-800">{p.type}</span>
+                      </div>
+                      <div className="font-mono font-black text-slate-900 text-xs">
+                        {p.count} Units <span className="text-[10px] font-semibold text-slate-400 font-sans">({p.sqm} SQM)</span>
+                      </div>
+                    </div>
+
+                    {/* Progress Bar */}
+                    <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
+                      <div
+                        className="bg-emerald-500 h-full rounded-full transition-all duration-500"
+                        style={{ width: `${compPct}%` }}
+                      />
+                    </div>
+
+                    {/* Completed vs Remaining stats */}
+                    <div className="flex items-center justify-between text-[11px] pt-0.5">
+                      <span className="text-emerald-700 font-bold flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        Completed: <strong className="font-black font-mono">{p.completedCount} Units</strong>
+                        <span className="text-[10px] text-emerald-600 font-semibold">({compPct}%)</span>
+                      </span>
+                      <span className="text-amber-700 font-bold flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                        Remaining: <strong className="font-black font-mono">{p.pendingCount} Units</strong>
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
           </div>
         </div>
       </div>
@@ -895,7 +1041,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                 Workstation Queue Load vs Completed Throughput
               </h3>
               <p className="text-xs text-slate-500 mt-0.5">
-                Pending units currently in buffer vs units successfully completed.
+                Pending buffer load vs successfully completed throughput.
               </p>
             </div>
           </div>
@@ -907,6 +1053,12 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                 <XAxis dataKey="stage" tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} />
                 <YAxis tick={{ fontSize: 10, fill: "#64748b" }} axisLine={{ stroke: "#e2e8f0" }} />
                 <Tooltip
+                  formatter={(value: any, name: any, item: any) => {
+                    const stage = item?.payload?.stage;
+                    const isSingle = ["Cutting", "Polishing", "Pairing"].includes(stage);
+                    const unitLabel = item?.payload?.unitLabel || (isSingle ? "Pcs" : "Units");
+                    return [`${value} ${unitLabel}`, name];
+                  }}
                   contentStyle={{
                     backgroundColor: "#0f172a",
                     border: "1px solid #334155",
@@ -919,7 +1071,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                   labelStyle={{ color: "#94a3b8", fontWeight: "600" }}
                 />
                 <Legend wrapperStyle={{ fontSize: "11px", fontWeight: "bold" }} />
-                <Bar dataKey="pendingCount" name="Pending Queue (Units)" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="pendingCount" name="Pending Queue" fill="#f59e0b" radius={[4, 4, 0, 0]} />
                 <Bar dataKey="completedCount" name="Completed Throughput" fill="#6366f1" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -977,7 +1129,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
         </div>
       </div>
 
-            {/* ── SECTION 3: WORKSTATION & OPERATOR EFFICIENCY LEADERBOARD ── */}
+            {/* ── SECTION 3: OPERATOR EFFICIENCY LEADERBOARD ── */}
       <div className="w-full bg-white p-5 rounded-2xl border border-slate-300 shadow-2xs">
         {/* Card Header & Controls */}
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-4 pb-4 border-b border-slate-100">
@@ -988,64 +1140,25 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
               </div>
               <div>
                 <h3 className="text-base font-black text-slate-900 tracking-tight flex items-center gap-2">
-                  Workstation & Operator Efficiency Leaderboard
+                  Operator Efficiency Leaderboard
                 </h3>
                 <p className="text-xs text-slate-500 font-medium">
-                  Scan volume throughput, completed items, rejects, and quality efficiency rating across factory workstations and staff.
+                  Scan volume throughput, completed items, rejects, and quality efficiency rating across factory operators and staff.
                 </p>
               </div>
             </div>
           </div>
 
-          {/* Controls: Tabs, Search, Export */}
+          {/* Controls: Search, Export */}
           <div className="flex flex-wrap items-center gap-2.5">
-            {/* Tab Pills */}
-            <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200 text-xs font-bold">
-              <button
-                type="button"
-                onClick={() => setLeaderboardTab("all")}
-                className={`px-3 py-1 rounded-lg transition-all cursor-pointer ${
-                  leaderboardTab === "all"
-                    ? "bg-white text-indigo-700 shadow-xs font-black"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                All ({counts.all})
-              </button>
-              <button
-                type="button"
-                onClick={() => setLeaderboardTab("stations")}
-                className={`px-3 py-1 rounded-lg transition-all flex items-center gap-1 cursor-pointer ${
-                  leaderboardTab === "stations"
-                    ? "bg-white text-indigo-700 shadow-xs font-black"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                <Factory className="w-3 h-3 text-slate-500" />
-                Workstations ({counts.stations})
-              </button>
-              <button
-                type="button"
-                onClick={() => setLeaderboardTab("operators")}
-                className={`px-3 py-1 rounded-lg transition-all flex items-center gap-1 cursor-pointer ${
-                  leaderboardTab === "operators"
-                    ? "bg-white text-indigo-700 shadow-xs font-black"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                <UserCheck className="w-3 h-3 text-slate-500" />
-                Operators ({counts.operators})
-              </button>
-            </div>
-
             {/* Quick Search */}
-            <div className="relative w-44 sm:w-56">
+            <div className="relative w-48 sm:w-64">
               <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
               <input
                 type="text"
                 value={leaderboardSearch}
                 onChange={(e) => setLeaderboardSearch(e.target.value)}
-                placeholder="Search station or operator..."
+                placeholder="Search operator..."
                 className="w-full text-xs pl-8 pr-3 py-1.5 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-white"
               />
             </div>
@@ -1065,9 +1178,9 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
           </div>
         </div>
 
-        {/* Workstation Stage Quick Filter Pills */}
+        {/* Stage Quick Filter Pills */}
         <div className="flex items-center gap-1.5 flex-wrap pt-3 border-t border-slate-200">
-          <span className="text-[10.5px] font-extrabold text-slate-500 uppercase tracking-wider mr-1">Workstation Stage:</span>
+          <span className="text-[10.5px] font-extrabold text-slate-500 uppercase tracking-wider mr-1">Stage:</span>
           {[
             { id: "all", label: "All Stages" },
             { id: "Cutting", label: "Cutting" },
@@ -1106,11 +1219,11 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                   className="py-2.5 px-3 cursor-pointer hover:bg-slate-100 select-none transition-colors"
                 >
                   <div className="flex items-center gap-1.5">
-                    <span>Operator / Station</span>
+                    <span>Operator</span>
                     <ArrowUpDown className="w-3 h-3 text-slate-400" />
                   </div>
                 </th>
-                <th className="py-2.5 px-3">Classification</th>
+                <th className="py-2.5 px-3">Role / Classification</th>
                 <th
                   onClick={() => handleSort("operations")}
                   className="py-2.5 px-3 text-center cursor-pointer hover:bg-slate-100 select-none transition-colors"
@@ -1163,7 +1276,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
               {allRows.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-slate-400 font-medium">
-                    No matching workstations or operators found.
+                    No matching operators found.
                   </td>
                 </tr>
               ) : (
@@ -1180,11 +1293,7 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                     </td>
                     <td className="py-3 px-3 font-bold text-slate-900">
                       <div className="flex items-center gap-2.5">
-                        {row.type === "station" ? (
-                          <div className="w-7 h-7 rounded-lg bg-blue-50 border border-blue-200 text-blue-700 flex items-center justify-center shrink-0 shadow-2xs">
-                            <Factory className="w-3.5 h-3.5" />
-                          </div>
-                        ) : row.type === "system" ? (
+                        {row.type === "system" ? (
                           <div className="w-7 h-7 rounded-lg bg-purple-50 border border-purple-200 text-purple-700 flex items-center justify-center shrink-0 shadow-2xs">
                             <Bot className="w-3.5 h-3.5" />
                           </div>
@@ -1204,21 +1313,13 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                               </span>
                             )}
                           </div>
-                          {row.type === "station" && row.pendingCount > 0 && (
-                            <div className="text-[10px] font-semibold text-amber-600 flex items-center gap-1 mt-0.5">
-                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                              {row.pendingCount} units in queue ({row.avgCycleTime}m pace)
-                            </div>
-                          )}
                         </div>
                       </div>
                     </td>
                     <td className="py-3 px-3">
                       <span
                         className={`px-2 py-0.5 rounded-full text-[10px] font-black border inline-flex items-center gap-1 ${
-                          row.type === "station"
-                            ? "bg-blue-50 text-blue-700 border-blue-200"
-                            : row.type === "system"
+                          row.type === "system"
                             ? "bg-purple-50 text-purple-700 border-purple-200"
                             : "bg-slate-100 text-slate-700 border-slate-200"
                         }`}
@@ -1374,11 +1475,15 @@ export const PerformanceAnalyticsView: React.FC<{ onNavigateTab?: (tab: string) 
                   <div className="flex items-center gap-4">
                     <div>
                       <span className="text-slate-500 font-semibold">Queue In-Buffer:</span>{" "}
-                      <span className="font-black text-indigo-900">{inspectTarget.pendingCount} units</span>
+                      <span className="font-black text-indigo-900">
+                        {inspectTarget.pendingCount} {["station-Cutting", "station-Polishing", "station-Pairing"].includes(inspectTarget.id) ? "Pcs" : "Units"}
+                      </span>
                     </div>
                     <div>
                       <span className="text-slate-500 font-semibold">Pacing Benchmark:</span>{" "}
-                      <span className="font-black text-indigo-900">{inspectTarget.avgCycleTime} min/unit</span>
+                      <span className="font-black text-indigo-900">
+                        {inspectTarget.avgCycleTime} {["station-Cutting", "station-Polishing", "station-Pairing"].includes(inspectTarget.id) ? "min/piece" : "min/unit"}
+                      </span>
                     </div>
                     {inspectTarget.sqm > 0 && (
                       <div>

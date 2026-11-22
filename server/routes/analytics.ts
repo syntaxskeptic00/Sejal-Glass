@@ -28,6 +28,10 @@ import { getAllUserRecords } from "../lib/users";
 function getDguEffectiveQtyAndSqm(item: GlassItem) {
   const isDgu = isDguGlass(item);
   const isDlgu = isDlguGlass(item);
+  const isLami =
+    isLaminatedGlass(item) ||
+    item.glassCategory === "Lamination" ||
+    (Array.isArray(item.processRoute) && item.processRoute.includes("Lamination"));
   if (isDlgu) {
     return {
       qty: 1,
@@ -44,11 +48,83 @@ function getDguEffectiveQtyAndSqm(item: GlassItem) {
       sqm: unitSqm,
     };
   }
+  if (isLami) {
+    const unitQty = Math.ceil((item.qty || 1) / 2);
+    const unitSqm = parseFloat(((item.width * item.height * unitQty) / 1000000).toFixed(2));
+    return {
+      qty: unitQty,
+      unitLabel: "Laminated Unit",
+      sqm: unitSqm,
+    };
+  }
   return {
     qty: item.qty || 1,
     unitLabel: "Pcs",
     sqm: item.sqm || parseFloat(((item.width * item.height * (item.qty || 1)) / 1000000).toFixed(2)),
   };
+}
+
+function computeUnits(list: GlassItem[]): number {
+  const isColour = (i: any) =>
+    (i.glassFinish || i.glassType || "").toLowerCase().includes("colour") ||
+    (i.glassDescription || "").toLowerCase().includes("colour");
+  const isLam = (i: any) =>
+    isLaminatedGlass(i) ||
+    i.glassCategory === "Lamination" ||
+    (Array.isArray(i.processRoute) && i.processRoute.includes("Lamination"));
+  const isDlgu = (i: any) => isDlguGlass(i);
+  const isDgu = (i: any) => isDguGlass(i);
+
+  const dlguList = list.filter(isDlgu);
+  const pureDguList = list.filter((i) => isDgu(i) && !isDlgu(i));
+  const nonDguList = list.filter((i) => !isDgu(i));
+
+  const dlguColour = dlguList.filter(isColour).reduce((a, b) => a + (b.qty || 1), 0);
+  const dlguClear = dlguList.filter((i) => !isColour(i)).reduce((a, b) => a + (b.qty || 1), 0);
+  const dlguUnits =
+    dlguColour > 0 && dlguClear > 0
+      ? Math.min(dlguColour, Math.floor(dlguClear / 2))
+      : Math.floor((dlguColour + dlguClear) / 3);
+
+  const finDguColourPanes = pureDguList.filter(isColour).reduce((a, b) => a + (b.qty || 1), 0);
+  const finDguClearPanes = pureDguList.filter((i) => !isColour(i)).reduce((a, b) => a + (b.qty || 1), 0);
+  const pureDguUnits =
+    finDguColourPanes > 0 && finDguClearPanes > 0
+      ? Math.min(finDguColourPanes, finDguClearPanes)
+      : finDguColourPanes > 0
+      ? finDguColourPanes
+      : Math.ceil(pureDguList.reduce((a, b) => a + (b.qty || 1), 0) / 2);
+
+  const lamList = nonDguList.filter(isLam);
+  const monoList = nonDguList.filter((i) => !isLam(i));
+  const lamUnits = Math.ceil(lamList.reduce((a, b) => a + (b.qty || 1), 0) / 2);
+  const monoUnits = monoList.reduce((a, b) => a + (b.qty || 1), 0);
+
+  return dlguUnits + pureDguUnits + lamUnits + monoUnits;
+}
+
+export function isItemInPackingStage(i: any): boolean {
+  if (!i || i.isDispatched || i.currentStage === "Dispatched" || i.status === "Rejected") return false;
+  const isIgu = isDguGlass(i) || isDlguGlass(i) || i.glassCategory === "DGU" || i.glassCategory === "DLGU" || Boolean(i.dguPairId);
+  const isLami = !isIgu && (isLaminatedGlass(i) || i.glassCategory === "Laminated" || i.glassCategory === "Lamination");
+  if (!isIgu && !isLami) return false;
+  if (i.sentToFinished) return false;
+  if (i.packingRackNo && String(i.packingRackNo).toUpperCase().includes("DIRECT FINISH")) return false;
+  if (i.packingRackNo) return true;
+  const sentFromUpstream =
+    i.currentStage === "Finished" ||
+    (Array.isArray(i.completedStages) && (i.completedStages.includes("DGU") || i.completedStages.includes("Lamination") || i.completedStages.includes("Finished")));
+  return Boolean(sentFromUpstream);
+}
+
+export function isItemCompleted(item: any): boolean {
+  if (!item || item.status === "Rejected" || (item as any).isRejected) return false;
+  if (isItemInPackingStage(item)) return false;
+  if (item.isDispatched || item.currentStage === "Dispatched") return true;
+  if (Boolean(item.sentToFinished)) return true;
+  if (item.packingRackNo && String(item.packingRackNo).toUpperCase().includes("DIRECT FINISH")) return true;
+  if (item.currentStage === "Finished" && !isDguGlass(item) && !isDlguGlass(item) && !isLaminatedGlass(item)) return true;
+  return false;
 }
 
 const ALL_STAGES: ProductionStage[] = ["Cutting", "Polishing", "Pairing", "DGU", "Lamination", "Finished"];
@@ -152,17 +228,19 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
     let completedSqm = 0;
     let inProgressSqm = 0;
 
-    const completedItems = filteredItems.filter(
-      (item) => item.status === "Completed" || item.currentStage === "Finished"
-    );
+    const completedItems = filteredItems.filter(isItemCompleted);
     const completedGlassItems = completedItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const rejectedGlassItems = filteredItems.filter((i) => i.status === "Rejected").reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const inProgressGlassItems = Math.max(0, totalGlassItems - completedGlassItems - rejectedGlassItems);
 
+    const totalUnits = computeUnits(filteredItems);
+    const completedUnits = computeUnits(completedItems);
+    const inProgressUnits = Math.max(0, totalUnits - completedUnits);
+
     filteredItems.forEach((item) => {
       const eff = getDguEffectiveQtyAndSqm(item);
       totalVolumeSqm += eff.sqm;
-      if (item.status === "Completed" || item.currentStage === "Finished") {
+      if (isItemCompleted(item)) {
         completedSqm += eff.sqm;
       } else if (item.status !== "Rejected") {
         inProgressSqm += eff.sqm;
@@ -241,8 +319,9 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
     const stageAnalyticsMap: StageAnalytics[] = stagesToAnalyze.map((stage) => {
       if (stage === "Finished") {
         const finishedItemsList = filteredItems.filter(
-          (i) => (i.currentStage === "Finished" || i.currentStage === "Dispatched" || i.isDispatched || i.status === "Completed") && i.status !== "Rejected"
+          (i) => isItemCompleted(i)
         );
+        const finishedUnits = computeUnits(finishedItemsList);
         const finishedSqm = finishedItemsList.reduce((acc, item) => acc + (item.sqm || 0), 0);
         const utilization =
           totalGlassItems > 0
@@ -250,20 +329,21 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
             : 0;
 
         const stageRejects = filteredRejects.filter((r) => r.stage === "Finished" || r.stage === "Dispatched").length;
-        const totalOps = finishedItemsList.length + stageRejects;
-        const qualityYield = totalOps > 0 ? parseFloat(((finishedItemsList.length / totalOps) * 100).toFixed(1)) : 100;
+        const totalOps = finishedUnits + stageRejects;
+        const qualityYield = totalOps > 0 ? parseFloat(((finishedUnits / totalOps) * 100).toFixed(1)) : 100;
 
         return {
           stage,
           pendingCount: 0,
           pendingSqm: 0,
-          completedCount: finishedItemsList.length,
+          completedCount: finishedUnits,
           completedSqm: parseFloat(finishedSqm.toFixed(2)),
-          throughputRate: finishedItemsList.length,
+          throughputRate: finishedUnits,
           avgCycleTimeMinutes: 12,
           capacityUtilization: utilization,
           rejectedCount: stageRejects,
           qualityYield,
+          unitLabel: "Units",
         };
       }
 
@@ -272,12 +352,19 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
       );
       const completedStageItems = filteredItems.filter((i) => i.completedStages?.includes(stage));
 
-      const pendingSqm = pending.reduce((acc, item) => acc + (item.sqm || 0), 0);
-      const stageCompletedSqm = completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0);
+      const isPairedStage = stage === "DGU" || stage === "Lamination";
+      const isSingleStage = stage === "Cutting" || stage === "Polishing" || stage === "Pairing";
+      const unitLabel: "Pcs" | "Units" = isSingleStage ? "Pcs" : "Units";
 
-      const isDguStage = stage === "DGU";
-      const pendingCount = isDguStage ? Math.ceil(pending.length / 2) : pending.length;
-      const completedCount = isDguStage ? Math.ceil(completedStageItems.length / 2) : completedStageItems.length;
+      const pendingCount = isPairedStage ? Math.ceil(pending.length / 2) : pending.length;
+      const completedCount = isPairedStage ? Math.ceil(completedStageItems.length / 2) : completedStageItems.length;
+
+      const pendingSqm = isPairedStage
+        ? pending.reduce((acc, item) => acc + (item.sqm || 0), 0) / 2
+        : pending.reduce((acc, item) => acc + (item.sqm || 0), 0);
+      const stageCompletedSqm = isPairedStage
+        ? completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0) / 2
+        : completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0);
 
       const totalStageUnits = pendingCount + completedCount;
       const utilization =
@@ -298,6 +385,7 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
         capacityUtilization: utilization,
         rejectedCount: stageRejects,
         qualityYield,
+        unitLabel,
       };
     });
 
@@ -309,9 +397,15 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
       const pendingInStage = filteredItems.filter(
         (i) => i.currentStage === stg && i.status !== "Completed" && i.status !== "Rejected"
       );
-      const pendingUnits = stg === "DGU" ? Math.ceil(pendingInStage.length / 2) : pendingInStage.length;
+      const isSingleStage = stg === "Cutting" || stg === "Polishing" || stg === "Pairing";
+      const unitLabel: "Pcs" | "Units" = isSingleStage ? "Pcs" : "Units";
+      const isPairedStage = stg === "DGU" || stg === "Lamination";
+      const pendingUnits = isPairedStage ? Math.ceil(pendingInStage.length / 2) : pendingInStage.length;
       const pendingSqm = parseFloat(
-        pendingInStage.reduce((acc, i) => acc + (i.sqm || 0), 0).toFixed(2)
+        (isPairedStage
+          ? pendingInStage.reduce((acc, i) => acc + (i.sqm || 0), 0) / 2
+          : pendingInStage.reduce((acc, i) => acc + (i.sqm || 0), 0)
+        ).toFixed(2)
       );
 
       let riskLevel: "Low" | "Medium" | "High" = "Low";
@@ -321,11 +415,11 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
       if (pendingUnits > 40) {
         riskLevel = "High";
         avgWaitHours = 6.8;
-        bottleneckReason = `Heavy backlog (${pendingUnits} units waiting). Machine or pairing queue threshold exceeded.`;
+        bottleneckReason = `Heavy backlog (${pendingUnits} ${unitLabel} waiting). Machine or pairing queue threshold exceeded.`;
       } else if (pendingUnits > 15) {
         riskLevel = "Medium";
         avgWaitHours = 3.4;
-        bottleneckReason = `Moderate queue build-up (${pendingUnits} units). Advise increasing workstation pacing.`;
+        bottleneckReason = `Moderate queue build-up (${pendingUnits} ${unitLabel}). Advise increasing workstation pacing.`;
       }
 
       if (pendingUnits > maxPendingUnits && pendingUnits > 0) {
@@ -340,46 +434,55 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
         riskLevel,
         avgWaitHours,
         bottleneckReason,
+        unitLabel,
       };
     });
 
-    // 7. Product Type Breakdown (DLGU, DGU, Lamination, Single)
-    const typeBreakdownMap: Record<string, { count: number; sqm: number; completed: number; pending: number }> = {
-      "DLGU Units": { count: 0, sqm: 0, completed: 0, pending: 0 },
-      "DGU / IGU Units": { count: 0, sqm: 0, completed: 0, pending: 0 },
-      "Laminated Glass": { count: 0, sqm: 0, completed: 0, pending: 0 },
-      "Single Monolithic": { count: 0, sqm: 0, completed: 0, pending: 0 },
+    // 7. Product Type Breakdown (DLGU, DGU, Lamination) - Excludes Single Monolithic
+    const isDlgu = (i: GlassItem) => isDlguGlass(i);
+    const isDgu = (i: GlassItem) => isDguGlass(i) && !isDlguGlass(i);
+    const isLam = (i: GlassItem) =>
+      !isDguGlass(i) &&
+      !isDlguGlass(i) &&
+      (isLaminatedGlass(i) ||
+        i.glassCategory === "Lamination" ||
+        (Array.isArray(i.processRoute) && i.processRoute.includes("Lamination")));
+
+    const dlguItems = filteredItems.filter(isDlgu);
+    const dguItems = filteredItems.filter(isDgu);
+    const lamItems = filteredItems.filter(isLam);
+
+    const calcCategoryBreakdown = (itemsList: GlassItem[], label: string) => {
+      const completedList = itemsList.filter(isItemCompleted);
+      const totalUnits = computeUnits(itemsList);
+      const completedUnits = computeUnits(completedList);
+      const pendingUnits = Math.max(0, totalUnits - completedUnits);
+
+      let unitSqm = 0;
+      if (label === "DLGU Units") {
+        unitSqm =
+          itemsList.filter((i: any) => (i.glassFinish || i.glassType || "").toLowerCase().includes("colour")).reduce((a, b) => a + (b.sqm || 0), 0) ||
+          (itemsList.reduce((a, b) => a + (b.sqm || 0), 0) / 3);
+      } else if (label === "DGU / IGU Units") {
+        unitSqm = itemsList.reduce((a, b) => a + (b.sqm || 0), 0) / 2;
+      } else {
+        unitSqm = itemsList.reduce((a, b) => a + (b.sqm || 0), 0) / 2;
+      }
+
+      return {
+        type: label,
+        count: totalUnits,
+        sqm: parseFloat(unitSqm.toFixed(2)),
+        completedCount: completedUnits,
+        pendingCount: pendingUnits,
+      };
     };
 
-    filteredItems.forEach((item) => {
-      const eff = getDguEffectiveQtyAndSqm(item);
-      let cat = "Single Monolithic";
-      if (isDlguGlass(item)) {
-        cat = "DLGU Units";
-      } else if (isDguGlass(item)) {
-        cat = "DGU / IGU Units";
-      } else if (isLaminatedGlass(item)) {
-        cat = "Laminated Glass";
-      }
-
-      typeBreakdownMap[cat].count += eff.qty;
-      typeBreakdownMap[cat].sqm += eff.sqm;
-      if (item.status === "Completed" || item.currentStage === "Finished") {
-        typeBreakdownMap[cat].completed += eff.qty;
-      } else {
-        typeBreakdownMap[cat].pending += eff.qty;
-      }
-    });
-
-    const productTypeBreakdown: ProductTypeBreakdown[] = Object.entries(typeBreakdownMap).map(
-      ([type, val]) => ({
-        type,
-        count: val.count,
-        sqm: parseFloat(val.sqm.toFixed(2)),
-        completedCount: val.completed,
-        pendingCount: val.pending,
-      })
-    );
+    const productTypeBreakdown: ProductTypeBreakdown[] = [
+      calcCategoryBreakdown(dlguItems, "DLGU Units"),
+      calcCategoryBreakdown(dguItems, "DGU / IGU Units"),
+      calcCategoryBreakdown(lamItems, "Laminated Glass"),
+    ];
 
     // 8. Quality Defect Analysis (Pareto Distribution)
     const defectMap: Record<string, { count: number; stage: ProductionStage | "General" }> = {};
@@ -601,12 +704,10 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
     const piFulfillment: PIFulfillmentAnalytics[] = piDatabase.map((pi) => {
       const piItems = glassItemsDatabase.filter((i) => i.piId === pi.id || i.piNumber === pi.piNumber);
       const totalItems = piItems.length > 0 ? piItems.length : pi.itemsCount || 1;
-      const completedItemsInPI = piItems.filter(
-        (i) => i.status === "Completed" || i.currentStage === "Finished"
-      ).length;
+      const completedItemsInPI = piItems.filter(isItemCompleted).length;
       const totalSqm = piItems.length > 0 ? piItems.reduce((a, b) => a + (b.sqm || 0), 0) : pi.totalSqm || 0;
       const compSqm = piItems
-        .filter((i) => i.status === "Completed" || i.currentStage === "Finished")
+        .filter(isItemCompleted)
         .reduce((a, b) => a + (b.sqm || 0), 0);
 
       const percentage = totalItems > 0 ? parseFloat(((completedItemsInPI / totalItems) * 100).toFixed(1)) : 0;
@@ -641,6 +742,9 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
         totalGlassItems,
         completedGlassItems,
         inProgressGlassItems,
+        totalUnits,
+        completedUnits,
+        inProgressUnits,
         completedSqm: parseFloat(completedSqm.toFixed(2)),
         inProgressSqm: parseFloat(inProgressSqm.toFixed(2)),
         rejectRate,

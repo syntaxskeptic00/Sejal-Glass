@@ -1184,14 +1184,14 @@ export const ProductionOverviewView: React.FC<ProductionOverviewViewProps> = ({
                             }`}
                           title="DGU Assembly Station"
                         >
-                          DGU: {b.dguCount}
+                          DGU: {Math.ceil(b.dguCount / 2)} U
                         </span>
                         <span
                           className={`px-1.5 py-0.5 rounded text-[10px] font-black ${b.laminationCount > 0 ? "bg-amber-100 text-amber-800 border border-amber-200" : "bg-slate-100 text-slate-400"
                             }`}
                           title="Lamination Autoclave"
                         >
-                          Lam: {b.laminationCount}
+                          Lam: {Math.ceil(b.laminationCount / 2)} U
                         </span>
                         <span
                           className={`px-1.5 py-0.5 rounded text-[10px] font-black ${b.packingIguCount > 0 ? "bg-teal-100 text-teal-800 border border-teal-200" : "bg-slate-100 text-slate-400"

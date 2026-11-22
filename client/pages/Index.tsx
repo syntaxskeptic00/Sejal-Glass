@@ -76,7 +76,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/AppSidebar";
 import { useAuth } from "@/context/AuthContext";
-import { formatBatchNumber, formatPlatformDate, formatPlatformTime, getItemFinish, isDguGlass, isLaminatedGlass, isDlguGlass, isDispatchedItem, calculateAssembledUnits, countPackingUnits, parseRackInfo, isPackingIguItem, isPackingLamiItem, isItemInPackingStage, isItemInFinishedStage, getAllocatedPackingRack, getActivePackingShift } from "@/lib/utils";
+import { formatBatchNumber, formatPlatformDate, formatPlatformTime, getItemFinish, isDguGlass, isLaminatedGlass, isDlguGlass, isDispatchedItem, calculateAssembledUnits, countPackingUnits, parseRackInfo, isPackingIguItem, isPackingLamiItem, isItemInPackingStage, isItemInFinishedStage, isItemCompleted, getAllocatedPackingRack, getActivePackingShift } from "@/lib/utils";
 import { exportStageWipToExcel, exportBatchProgressMatrixToExcel } from "@/lib/excelExport";
 
 import { StickerUploaderModal } from "@/components/StickerUploaderModal";
@@ -1283,11 +1283,13 @@ export default function Index() {
         activeStageTab = isIguPack ? "packing-igu" : "packing-lami";
         activeStageBadgeClass = isIguPack ? "bg-teal-100 text-teal-800 border-teal-200" : "bg-amber-100 text-amber-800 border-amber-200";
       } else if (inDgu > 0) {
-        activeStageName = `DLGU / IGU (${inDgu} pcs)`;
+        const dguUnits = Math.ceil(inDgu / 2);
+        activeStageName = `DLGU / IGU (${dguUnits} Units • ${inDgu} pcs)`;
         activeStageTab = "dgu";
         activeStageBadgeClass = "bg-teal-100 text-teal-800 border-teal-200";
       } else if (inLamination > 0) {
-        activeStageName = `Lamination (${inLamination} pcs)`;
+        const lamUnits = Math.ceil(inLamination / 2);
+        activeStageName = `Lamination (${lamUnits} Units • ${inLamination} pcs)`;
         activeStageTab = "lamination";
         activeStageBadgeClass = "bg-amber-100 text-amber-800 border-amber-200";
       } else if (inPairing > 0) {
@@ -1605,7 +1607,7 @@ export default function Index() {
       const custUnitMetrics = calculateAssembledUnits(uniqueCustItems);
       const totalUnits = custUnitMetrics.totalUnits > 0 ? custUnitMetrics.totalUnits : totalPieces;
       const completedCustItems = uniqueCustItems.filter(
-        (i) => isItemInFinishedStage(i) || isDispatchedItem(i) || i.status === "Completed"
+        (i) => isItemCompleted(i)
       );
       const completedUnits = calculateAssembledUnits(completedCustItems).totalUnits;
 
@@ -2566,7 +2568,7 @@ export default function Index() {
                 (i) => (i.status === "Rejected" || ((i as any).isRejected && i.status !== "Completed") || unresolvedRejectSerials.has(i.serialNumber)) && i.status !== "Completed"
               );
               const completedSummaryItems = filteredSummaryItems.filter(
-                (i) => i.status !== "Rejected" && !(i as any).isRejected && !unresolvedRejectSerials.has(i.serialNumber) && (isItemInFinishedStage(i) || isDispatchedItem(i) || i.status === "Completed")
+                (i) => i.status !== "Rejected" && !(i as any).isRejected && !unresolvedRejectSerials.has(i.serialNumber) && isItemCompleted(i)
               );
               const inProgressSummaryItems = filteredSummaryItems.filter(
                 (i) =>
@@ -4088,7 +4090,7 @@ export default function Index() {
                                     title="View Lamination items for this customer and project"
                                   >
                                     <Flame className="w-3 h-3 text-amber-600" />
-                                    <span>Lamination: <strong>{customer.inLamination}</strong></span>
+                                    <span>Lamination: <strong>{customer.inLamination > 0 ? `${Math.ceil(customer.inLamination / 2)} Units` : 0}</strong></span>
                                   </button>
 
                                   <button
@@ -4104,7 +4106,7 @@ export default function Index() {
                                     title="View DGU / IGU items for this customer and project"
                                   >
                                     <ShieldCheck className="w-3 h-3 text-teal-600" />
-                                    <span>DGU: <strong>{customer.inDgu}</strong></span>
+                                    <span>DGU: <strong>{customer.inDgu > 0 ? `${Math.ceil(customer.inDgu / 2)} Units` : 0}</strong></span>
                                   </button>
 
                                   <button
@@ -4299,7 +4301,11 @@ export default function Index() {
                   </div>
                 }
               >
-                <PerformanceAnalyticsView onNavigateTab={(tab) => setActiveTab(tab as any)} />
+                <PerformanceAnalyticsView
+                  onNavigateTab={(tab) => setActiveTab(tab as any)}
+                  effectiveStats={effectiveStats}
+                  allItems={items}
+                />
               </React.Suspense>
             )}
             {/* TAB: SETTINGS */}

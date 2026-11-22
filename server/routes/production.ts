@@ -4167,8 +4167,8 @@ export const handleGetDashboardStats: RequestHandler = (_req, res) => {
     const isIgu = isDgu(i) || isDlguItem(i);
     const isLami = isLam(i);
     if (isIgu || isLami) {
-      const hasRack = Boolean(i.packingRackNo && String(i.packingRackNo).trim());
-      return hasRack || Boolean(i.sentToFinished);
+      const isDirectFinish = i.packingRackNo && normalizeRackNo(i.packingRackNo) === "Direct Finish";
+      return Boolean(i.sentToFinished || isDirectFinish);
     }
     return true;
   });
@@ -4627,7 +4627,7 @@ export const handleDeleteItems: RequestHandler = (req, res) => {
     if (pi) {
       const remainingItems = glassItemsDatabase.filter((i) => i.piId === pi.id || i.piNumber === pi.piNumber);
       pi.itemsCount = remainingItems.length;
-      pi.completedItemsCount = remainingItems.filter((i) => (i.currentStage === "Finished" || i.currentStage === "Dispatched" || i.isDispatched || i.status === "Completed") && i.status !== "Rejected").length;
+      pi.completedItemsCount = remainingItems.filter((i) => (i.currentStage === "Finished" || i.currentStage === "Dispatched" || i.isDispatched || i.status === "Completed") && i.status !== "Rejected" && !isPackingIguServerItem(i) && !isPackingLamiServerItem(i)).length;
     }
   }
 
@@ -4944,6 +4944,7 @@ export const handlePackToRack: RequestHandler = (req, res) => {
         packedAt: nowIso,
         packedBy: cleanOperator,
         packingStatus: "Packed",
+        status: shouldSendToFinished ? "Completed" : "In Production",
         currentStage: "Finished",
         completedStages: Array.from(new Set([...(item.completedStages || []), "Finished"])),
         sentToFinished: shouldSendToFinished,
@@ -4977,6 +4978,7 @@ export const handlePackToRack: RequestHandler = (req, res) => {
       item.packedAt = nowIso;
       item.packedBy = cleanOperator;
       item.packingStatus = "Packed";
+      item.status = shouldSendToFinished ? "Completed" : "In Production";
       item.currentStage = "Finished";
       if (shouldSendToFinished) {
         item.sentToFinished = true;
@@ -5192,6 +5194,7 @@ export const handleSendToFinished: RequestHandler = (req, res) => {
     item.sentToFinishedAt = nowIso;
     item.sentToFinishedBy = cleanOperator;
     item.packingStatus = "Packed";
+    item.status = "Completed";
     if (!item.completedStages) item.completedStages = [];
     if (!item.completedStages.includes("Finished")) {
       item.completedStages.push("Finished");
