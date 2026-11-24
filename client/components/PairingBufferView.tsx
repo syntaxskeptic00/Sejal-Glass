@@ -366,34 +366,26 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
 
     // Convert groups into Position Rows with exact Cut & Remaining computations
     const rows: ConsolidatedPositionRow[] = Array.from(positionMap.values()).map((g: any, idx) => {
-      // For DLGU Clear, 2 laminated raw panes form 1 composite unit (e.g. 96 panes = 48 units)
-      const isDlguClearUnit = g.glassCategory === "DLGU" && g.finish === "Clear";
-
-      // Total pieces uploaded for this position
-      const rawTotalPieces = g.rawItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
-      const totalPieces = isDlguClearUnit ? Math.ceil(rawTotalPieces / 2) : rawTotalPieces;
+      // Total pieces uploaded for this position (all raw physical glass panes)
+      const totalPieces = g.rawItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
 
       // Pieces cut (advanced from cutting)
-      const rawCutPieces = g.rawItems
+      const cutPieces = g.rawItems
         .filter((i: any) => i.currentStage?.toLowerCase() !== "cutting")
         .reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
-      const cutPieces = isDlguClearUnit ? Math.ceil(rawCutPieces / 2) : rawCutPieces;
 
       // Pieces still remaining in cutting
-      const rawRemainingPieces = g.rawItems
+      const remainingPieces = g.rawItems
         .filter((i: any) => i.currentStage?.toLowerCase() === "cutting")
         .reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
-      const remainingPieces = isDlguClearUnit ? Math.ceil(rawRemainingPieces / 2) : rawRemainingPieces;
 
       // Pieces currently waiting in buffer
-      const rawBufferPieces = g.bufferItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
-      const bufferPieces = isDlguClearUnit ? Math.ceil(rawBufferPieces / 2) : rawBufferPieces;
+      const bufferPieces = g.bufferItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
 
       // Pieces assembled and dispatched to Finished
-      const rawFinishedPieces = g.rawItems
+      const finishedPieces = g.rawItems
         .filter((i: any) => i.currentStage?.toLowerCase() === "finished" || i.status === "Completed")
         .reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
-      const finishedPieces = isDlguClearUnit ? Math.ceil(rawFinishedPieces / 2) : rawFinishedPieces;
 
       const totalSqm = parseFloat(((g.width * g.height * totalPieces) / 1000000).toFixed(2));
       const cutSqm = parseFloat(((g.width * g.height * cutPieces) / 1000000).toFixed(2));
@@ -459,9 +451,10 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
         // Ready pairs is the minimum of cut pieces in buffer / available in lamination for both sides
         const partnerAvailable =
           row.glassCategory === "DLGU" && row.finish === "Colour"
-            ? (partner.dlguPhase === "DguPairing" ? partner.inBufferQty : Math.ceil(partner.rawItems.filter((i: any) => i.currentStage === "Lamination" || (i.currentStage === "Pairing" && i.completedStages?.includes("Lamination"))).reduce((a: number, b: any) => a + (b.qty || 1), 0) / 2))
-            : partner.inBufferQty;
-        row.readyPairsCount = Math.min(row.inBufferQty, partnerAvailable);
+            ? (partner.dlguPhase === "DguPairing" ? Math.floor(partner.inBufferQty / 2) : Math.ceil(partner.rawItems.filter((i: any) => i.currentStage === "Lamination" || (i.currentStage === "Pairing" && i.completedStages?.includes("Lamination"))).reduce((a: number, b: any) => a + (b.qty || 1), 0) / 2))
+            : (row.glassCategory === "DLGU" && row.finish === "Clear" ? partner.inBufferQty : partner.inBufferQty);
+        const myAvailable = row.glassCategory === "DLGU" && row.finish === "Clear" ? Math.floor(row.inBufferQty / 2) : row.inBufferQty;
+        row.readyPairsCount = Math.min(myAvailable, partnerAvailable);
         row.waitingFinish = partner.finish !== row.finish
           ? partner.finish
           : (partner.thickness ? `${partner.thickness} ${partner.finish}` : (partner.glassType.split("/")[0].trim() as any));
@@ -514,11 +507,12 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
           if (!isRowPending(row)) return false;
 
           // Sub-filters inside Pending Glass tab
+          if (pendingSubFilter === "ALL" && row.remainingQty === 0) return false;
           if (pendingSubFilter === "CUTTING" && row.remainingQty === 0) return false;
           if (pendingSubFilter === "BUFFER" && (row.inBufferQty === 0 || (row.matchingPartnerRow && row.readyPairsCount >= row.inBufferQty))) return false;
-          if (pendingSubFilter === "DGU" && row.glassCategory !== "DGU") return false;
-          if (pendingSubFilter === "LAMINATION" && row.glassCategory !== "Lamination") return false;
-          if (pendingSubFilter === "DLGU" && row.glassCategory !== "DLGU") return false;
+          if (pendingSubFilter === "DGU" && (row.glassCategory !== "DGU" || row.remainingQty === 0)) return false;
+          if (pendingSubFilter === "LAMINATION" && (row.glassCategory !== "Lamination" || row.remainingQty === 0)) return false;
+          if (pendingSubFilter === "DLGU" && (row.glassCategory !== "DLGU" || row.remainingQty === 0)) return false;
         } else {
           if (categoryFilter === "DGU" && row.glassCategory !== "DGU") return false;
           if (categoryFilter === "LAMINATION" && row.glassCategory !== "Lamination") return false;
@@ -745,12 +739,12 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
 
   // Cross-category pending counts (All 3: DGU + Lamination + DLGU)
   const pendingRows = useMemo(() => consolidatedRows.filter(isRowPending), [consolidatedRows]);
-  const pendingPiecesCount = useMemo(() => pendingRows.reduce((sum, r) => sum + r.remainingQty + Math.max(0, r.inBufferQty - r.readyPairsCount), 0), [pendingRows]);
+  const pendingPiecesCount = useMemo(() => pendingRows.filter((r) => r.remainingQty > 0).reduce((sum, r) => sum + r.remainingQty, 0), [pendingRows]);
   const pendingCuttingPiecesCount = useMemo(() => pendingRows.filter((r) => r.remainingQty > 0).reduce((sum, r) => sum + r.remainingQty, 0), [pendingRows]);
   const pendingBufferPiecesCount = useMemo(() => pendingRows.filter((r) => r.inBufferQty > 0).reduce((sum, r) => sum + Math.max(0, r.inBufferQty - r.readyPairsCount), 0), [pendingRows]);
-  const pendingDguPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "DGU").reduce((sum, r) => sum + r.remainingQty + Math.max(0, r.inBufferQty - r.readyPairsCount), 0), [pendingRows]);
-  const pendingLamPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "Lamination").reduce((sum, r) => sum + r.remainingQty + Math.max(0, r.inBufferQty - r.readyPairsCount), 0), [pendingRows]);
-  const pendingDlguPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "DLGU").reduce((sum, r) => sum + r.remainingQty + Math.max(0, r.inBufferQty - r.readyPairsCount), 0), [pendingRows]);
+  const pendingDguPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "DGU" && r.remainingQty > 0).reduce((sum, r) => sum + r.remainingQty, 0), [pendingRows]);
+  const pendingLamPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "Lamination" && r.remainingQty > 0).reduce((sum, r) => sum + r.remainingQty, 0), [pendingRows]);
+  const pendingDlguPiecesCount = useMemo(() => pendingRows.filter((r) => r.glassCategory === "DLGU" && r.remainingQty > 0).reduce((sum, r) => sum + r.remainingQty, 0), [pendingRows]);
 
   // Auto-switch to whichever category has items if current category has 0
   useEffect(() => {
@@ -782,7 +776,7 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
       const matchCust = (r.customerName || (r as any).clientName || "Customer").trim() === selectedCustomerFilter;
       if (!matchCust) return false;
     }
-    if (categoryFilter === "ALL_PENDING") return isRowPending(r);
+    if (categoryFilter === "ALL_PENDING") return r.remainingQty > 0;
     if (categoryFilter === "DGU") return r.glassCategory === "DGU";
     if (categoryFilter === "LAMINATION") return r.glassCategory === "Lamination";
     if (categoryFilter === "DLGU") return r.glassCategory === "DLGU";
