@@ -77,7 +77,7 @@ function computeUnits(list: GlassItem[]): number {
 
   const dlguList = list.filter(isDlgu);
   const pureDguList = list.filter((i) => isDgu(i) && !isDlgu(i));
-  const nonDguList = list.filter((i) => !isDgu(i));
+  const nonDguList = list.filter((i) => !isDgu(i) && !isDlgu(i));
 
   const dlguColour = dlguList.filter(isColour).reduce((a, b) => a + (b.qty || 1), 0);
   const dlguClear = dlguList.filter((i) => !isColour(i)).reduce((a, b) => a + (b.qty || 1), 0);
@@ -352,19 +352,35 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
       );
       const completedStageItems = filteredItems.filter((i) => i.completedStages?.includes(stage));
 
-      const isPairedStage = stage === "DGU" || stage === "Lamination";
       const isSingleStage = stage === "Cutting" || stage === "Polishing" || stage === "Pairing";
       const unitLabel: "Pcs" | "Units" = isSingleStage ? "Pcs" : "Units";
 
-      const pendingCount = isPairedStage ? Math.ceil(pending.length / 2) : pending.length;
-      const completedCount = isPairedStage ? Math.ceil(completedStageItems.length / 2) : completedStageItems.length;
+      const dlguItemsCount = filteredItems.filter(isDlguGlass).length;
+      const isMajorityDlgu = dlguItemsCount > 0 && dlguItemsCount >= (filteredItems.length / 2);
 
-      const pendingSqm = isPairedStage
-        ? pending.reduce((acc, item) => acc + (item.sqm || 0), 0) / 2
-        : pending.reduce((acc, item) => acc + (item.sqm || 0), 0);
-      const stageCompletedSqm = isPairedStage
-        ? completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0) / 2
-        : completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0);
+      let pendingCount = pending.length;
+      let completedCount = completedStageItems.length;
+      let pendingSqm = pending.reduce((acc, item) => acc + (item.sqm || 0), 0);
+      let stageCompletedSqm = completedStageItems.reduce((acc, item) => acc + (item.sqm || 0), 0);
+
+      if (stage === "DGU") {
+        const divisor = isMajorityDlgu ? 3 : 2;
+        pendingCount = computeUnits(pending);
+        completedCount = computeUnits(completedStageItems);
+        pendingSqm = pendingSqm / divisor;
+        stageCompletedSqm = stageCompletedSqm / divisor;
+      } else if (stage === "Lamination") {
+        pendingCount = Math.ceil(pending.length / 2);
+        completedCount = Math.ceil(completedStageItems.length / 2);
+        pendingSqm = pendingSqm / 2;
+        stageCompletedSqm = stageCompletedSqm / 2;
+      } else if (stage === "Dispatched") {
+        pendingCount = computeUnits(pending);
+        completedCount = computeUnits(completedStageItems);
+        const divisor = isMajorityDlgu ? 3 : 2;
+        pendingSqm = pendingSqm / divisor;
+        stageCompletedSqm = stageCompletedSqm / divisor;
+      }
 
       const totalStageUnits = pendingCount + completedCount;
       const utilization =
@@ -567,12 +583,43 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
     filteredHistory.forEach((h) => {
       const rawOp = h.user || h.operator || "Production Line";
       const matchedUser = userLookup.get(rawOp.toLowerCase());
-      const resolvedName = matchedUser?.name || rawOp;
-      const resolvedUsername = matchedUser?.username;
-      const opKey = resolvedName;
       const rawStage = String(h.stage || "General");
       // Normalize stage name if needed
       const stg = rawStage === "Finished" ? "Dispatched" : rawStage;
+
+      // Handle unmapped generic "Operator" records: attribute pairing to Auto-Pairing Engine, ignore non-user placeholders
+      if (!matchedUser && rawOp.toLowerCase() === "operator") {
+        const engineKey = "Auto-Pairing Engine";
+        if (!opMap[engineKey]) {
+          opMap[engineKey] = {
+            name: engineKey,
+            username: undefined,
+            role: "System",
+            assignedStages: ["Pairing"],
+            operationsCount: 0,
+            completedCount: 0,
+            completedSqm: 0,
+            rejectCount: 0,
+            stageBreakdown: {},
+          };
+        }
+        if (!opMap[engineKey].stageBreakdown[stg]) {
+          opMap[engineKey].stageBreakdown[stg] = { completedCount: 0, completedSqm: 0, rejectCount: 0, qualityRate: 100 };
+        }
+        opMap[engineKey].operationsCount += 1;
+        const itemSqm = itemSqmLookup.get(h.serialNumber) || (h.barcode ? itemSqmLookup.get(h.barcode) : 0) || 0;
+        if (h.status === "Completed") {
+          opMap[engineKey].completedCount += 1;
+          opMap[engineKey].completedSqm += itemSqm;
+          opMap[engineKey].stageBreakdown[stg].completedCount += 1;
+          opMap[engineKey].stageBreakdown[stg].completedSqm += itemSqm;
+        }
+        return;
+      }
+
+      const resolvedName = matchedUser?.name || rawOp;
+      const resolvedUsername = matchedUser?.username;
+      const opKey = resolvedName;
 
       if (!opMap[opKey]) {
         opMap[opKey] = {
@@ -638,21 +685,59 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
 
     const operatorList: OperatorAnalytics[] = Object.entries(opMap)
       .map(([operator, data]) => {
-        const total = data.operationsCount + data.rejectCount;
-        const opQualityRate = total > 0 ? parseFloat(((data.completedCount / total) * 100).toFixed(1)) : 100;
+        const dlguItemsCount = filteredItems.filter(isDlguGlass).length;
+        const isMajorityDlgu = dlguItemsCount > 0 && dlguItemsCount >= (filteredItems.length / 2);
 
-        // Calculate quality rate for each stage in the breakdown
-        const formattedStageBreakdown: Record<string, { completedCount: number; completedSqm: number; rejectCount: number; qualityRate: number }> = {};
+        // Calculate quality rate and stage-appropriate unit/piece counts for each stage in the breakdown
+        // Single glass stages (Cutting, Polishing, Pairing): Pcs
+        // Combined glass stages (DGU, Lamination, Dispatched): Units
+        const formattedStageBreakdown: Record<string, { completedCount: number; completedSqm: number; rejectCount: number; qualityRate: number; unitLabel?: "Pcs" | "Units" }> = {};
+        let totalOperatorOps = 0;
+        let totalOperatorComp = 0;
+        let totalOperatorSqm = 0;
+        let totalOperatorRej = 0;
+
         Object.entries(data.stageBreakdown).forEach(([stageName, sData]) => {
-          const sTotal = sData.completedCount + sData.rejectCount;
-          const sYield = sTotal > 0 ? parseFloat(((sData.completedCount / sTotal) * 100).toFixed(1)) : 100;
+          const isSingle = ["Cutting", "Polishing", "Pairing"].includes(stageName);
+          let comp = sData.completedCount;
+          let sqm = sData.completedSqm;
+          let rej = sData.rejectCount;
+          const unitLabel: "Pcs" | "Units" = isSingle ? "Pcs" : "Units";
+
+          if (stageName === "DGU") {
+            const divisor = isMajorityDlgu ? 3 : 2;
+            comp = Math.floor(comp / divisor);
+            sqm = parseFloat((sqm / divisor).toFixed(2));
+            rej = Math.ceil(rej / divisor);
+          } else if (stageName === "Lamination") {
+            comp = Math.ceil(comp / 2);
+            sqm = parseFloat((sqm / 2).toFixed(2));
+            rej = Math.ceil(rej / 2);
+          } else if (stageName === "Dispatched" || stageName === "Finished") {
+            const divisor = isMajorityDlgu ? 3 : 2;
+            comp = Math.floor(comp / divisor);
+            sqm = parseFloat((sqm / divisor).toFixed(2));
+            rej = Math.ceil(rej / divisor);
+          }
+
+          const sTotal = comp + rej;
+          const sYield = sTotal > 0 ? parseFloat(((comp / sTotal) * 100).toFixed(1)) : 100;
           formattedStageBreakdown[stageName] = {
-            completedCount: sData.completedCount,
-            completedSqm: parseFloat(sData.completedSqm.toFixed(2)),
-            rejectCount: sData.rejectCount,
+            completedCount: comp,
+            completedSqm: parseFloat(sqm.toFixed(2)),
+            rejectCount: rej,
             qualityRate: sYield,
+            unitLabel,
           };
+
+          totalOperatorComp += comp;
+          totalOperatorRej += rej;
+          totalOperatorOps += sTotal;
+          totalOperatorSqm += sqm;
         });
+
+        const opTotal = totalOperatorOps;
+        const opQualityRate = opTotal > 0 ? parseFloat(((totalOperatorComp / opTotal) * 100).toFixed(1)) : 100;
 
         return {
           operator,
@@ -660,14 +745,15 @@ export const handleGetPerformanceAnalytics: RequestHandler = (req, res) => {
           username: data.username,
           role: data.role,
           assignedStages: data.assignedStages,
-          operationsCount: data.operationsCount,
-          completedCount: data.completedCount,
-          completedSqm: parseFloat(data.completedSqm.toFixed(2)),
-          rejectCount: data.rejectCount,
+          operationsCount: totalOperatorOps || data.operationsCount,
+          completedCount: totalOperatorComp || data.completedCount,
+          completedSqm: parseFloat((totalOperatorSqm || data.completedSqm).toFixed(2)),
+          rejectCount: totalOperatorRej || data.rejectCount,
           qualityRate: opQualityRate,
           stageBreakdown: formattedStageBreakdown,
         };
       })
+      .filter((op) => op.operator.toLowerCase() !== "operator" && op.operator.toLowerCase() !== "production line")
       .sort((a, b) => b.completedCount - a.completedCount || a.operator.localeCompare(b.operator));
 
     // 10. Daily / Timeline Production Trends

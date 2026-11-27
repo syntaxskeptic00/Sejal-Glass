@@ -76,7 +76,7 @@ export const ScanLookupModal: React.FC<ScanLookupModalProps> = ({
   useBarcodeScanner({
     enabled: open,
     priority: 10,
-    duplicateCooldownMs: 1800,
+    duplicateCooldownMs: 400,
     onScan: (scannedBarcode) => {
       const clean = cleanScannedBarcode(scannedBarcode);
       setSearchInput(clean);

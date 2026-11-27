@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { GlassItem, PIMaster, DashboardStats, ProductionStage } from "@shared/api";
+import { GlassItem, PIMaster, DashboardStats, ProductionStage, countPairingBufferUnits } from "@shared/api";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import {
   formatBatchNumber,
@@ -109,7 +109,7 @@ export const ProductionOverviewView: React.FC<ProductionOverviewViewProps> = ({
 
     const cuttingCount = cuttingItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const polishingCount = polishingItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
-    const pairingCount = pairingItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
+    const pairingCount = countPairingBufferUnits(pairingItemsList);
     const dguCount = dguItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const laminationCount = laminationItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const packingIguCount = packingIguItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
@@ -215,7 +215,7 @@ export const ProductionOverviewView: React.FC<ProductionOverviewViewProps> = ({
     const dlguStageUnits = Math.min(dlguTotalUnits, rawDlguUnits);
 
     const pairingStageColour = pairingItemsList.filter(isColour).reduce((acc, curr) => acc + (curr.qty || 1), 0);
-    const pairingStageTotal = pairingItemsList.reduce((acc, curr) => acc + (curr.qty || 1), 0);
+    const pairingStageTotal = pairingCount;
     const pairingStageClear = pairingStageTotal - pairingStageColour;
     const pairingStageUnits = pairingStageColour > 0 && pairingStageClear > 0
       ? Math.min(pairingStageColour, pairingStageClear)

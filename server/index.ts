@@ -7,9 +7,9 @@ import compression from "compression";
 import { UserRole } from "@shared/api";
 import { verifyToken } from "./lib/auth";
 import { logger } from "./lib/logger";
-import { getTargetDbName } from "./lib/mongodb";
-import { handleGetPIs, handleGetPIDetails, handleDeletePI, handleReleasePI, loadDatabaseFromDisk, syncDatabaseWithMongo, piDatabase, glassItemsDatabase, productionHistoryDatabase } from "./routes/pi";
-import { syncUsersWithMongo, findUserById, findUserByUsernameOrEmail } from "./lib/users";
+import { getTargetDbName, isPostgresActive, isPostgresConfigured } from "./lib/postgres";
+import { handleGetPIs, handleGetPIDetails, handleDeletePI, handleReleasePI, initProductionDatabase, piDatabase, glassItemsDatabase, productionHistoryDatabase } from "./routes/pi";
+import { initUsersDatabase, findUserById, findUserByUsernameOrEmail } from "./lib/users";
 import {
   handleScanLookup,
   handleAdvanceStage,
@@ -157,29 +157,32 @@ function rateLimiter(options: { windowMs?: number; max?: number } = {}) {
   };
 }
 
+let appInitPromise: Promise<void> | null = null;
+
 export async function initAppDatabases(): Promise<void> {
-  // Server reload trigger for db.json sync
-loadDatabaseFromDisk(true);
-  try {
-    await Promise.allSettled([
-      syncDatabaseWithMongo(),
-      syncUsersWithMongo(),
-    ]);
-  } catch (err: any) {
-    logger.error("Error during initial database sync", { error: err?.message || String(err) });
+  if (appInitPromise) return appInitPromise;
+
+  appInitPromise = (async () => {
+    try {
+      await Promise.allSettled([
+        initProductionDatabase(),
+        initUsersDatabase(),
+      ]);
+    } catch (err: any) {
+      logger.error("Error during initial PostgreSQL database sync", { error: err?.message || String(err) });
+    }
+  })();
+
+  await appInitPromise;
+  if (!isPostgresActive() && process.env.NODE_ENV !== "test" && !process.env.VITEST) {
+    appInitPromise = null;
   }
 }
 
 export function createServer() {
-  // Server reload trigger for db.json sync
-loadDatabaseFromDisk(true);
-
-  // Background non-blocking sync with MongoDB Atlas
-  syncDatabaseWithMongo().catch((err) => {
-    logger.error("Failed to sync database with MongoDB Atlas", { error: err?.message || String(err) });
-  });
-  syncUsersWithMongo().catch((err) => {
-    logger.error("Failed to sync users with MongoDB Atlas", { error: err?.message || String(err) });
+  // Start non-blocking PostgreSQL hydration (API middleware awaits completion on first request)
+  initAppDatabases().catch((err) => {
+    logger.error("Failed to initialize PostgreSQL databases", { error: err?.message || String(err) });
   });
 
   const app = express();
@@ -252,6 +255,14 @@ loadDatabaseFromDisk(true);
   // API Router (v1)
   const apiV1 = express.Router();
 
+  // Ensure PostgreSQL initial load has completed before handling API requests
+  apiV1.use(async (_req, _res, next) => {
+    if (process.env.NODE_ENV !== "test" && !process.env.VITEST) {
+      await initAppDatabases();
+    }
+    next();
+  });
+
   // Health check endpoint
   apiV1.get("/ping", (_req, res) => {
     res.json({ message: "ping pong", version: "v1" });
@@ -264,14 +275,16 @@ loadDatabaseFromDisk(true);
   apiV1.get("/db-status", (_req, res) => {
     res.json({
       status: "online",
-      mongoConfigured: Boolean(process.env.MONGODB_URI),
+      storage: "postgresql",
+      postgresConfigured: isPostgresConfigured(),
+      postgresActive: isPostgresActive(),
       dbName: getTargetDbName(),
       batchesCount: piDatabase.length,
       glassItemsCount: glassItemsDatabase.length,
       historyCount: productionHistoryDatabase.length,
       environment: process.env.NODE_ENV || "development",
       timestamp: new Date().toISOString(),
-      persistenceVerified: true,
+      persistenceVerified: isPostgresActive(),
     });
   });
 

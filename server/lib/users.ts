@@ -1,9 +1,7 @@
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
 import { UserRole, UserRecord, UserSession, RolePermissions, WorkstationAssignment } from "@shared/api";
 import { logger } from "./logger";
-import { loadUsersFromMongo, saveUsersToMongo } from "./mongodb";
+import { loadUsersFromPostgres, saveUsersToPostgres } from "./postgres";
 
 export interface User {
   id: string;
@@ -31,47 +29,8 @@ export interface UserProfile {
   customPermissions?: Partial<RolePermissions>;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), "server/data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
-const REVOKED_FILE = path.join(DATA_DIR, "revoked_users.json");
-
 export const revokedUserIds = new Set<string>();
 export const revokedUsernames = new Set<string>();
-
-export function loadRevokedUsersFromDisk(): void {
-  try {
-    if (fs.existsSync(REVOKED_FILE)) {
-      const content = fs.readFileSync(REVOKED_FILE, "utf-8");
-      if (content.trim()) {
-        const loaded = JSON.parse(content);
-        if (Array.isArray(loaded.userIds)) {
-          loaded.userIds.forEach((id: string) => revokedUserIds.add(id));
-        }
-        if (Array.isArray(loaded.usernames)) {
-          loaded.usernames.forEach((name: string) => revokedUsernames.add(name.toLowerCase()));
-        }
-      }
-    }
-  } catch (err) {
-    logger.warn("Failed to load revoked users list from disk", { err });
-  }
-}
-
-export function saveRevokedUsersToDisk(): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    const data = {
-      userIds: Array.from(revokedUserIds),
-      usernames: Array.from(revokedUsernames),
-      updatedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(REVOKED_FILE, JSON.stringify(data, null, 2), "utf-8");
-  } catch (err) {
-    logger.warn("Failed to save revoked users list to disk", { err });
-  }
-}
 
 export function isUserRevoked(id?: string, username?: string): boolean {
   if (id && revokedUserIds.has(id)) return true;
@@ -120,104 +79,73 @@ const DEFAULT_USERS: User[] = [
 ];
 
 export const usersDatabase: User[] = [...DEFAULT_USERS];
+let usersInitPromise: Promise<void> | null = null;
 
-// Load users from disk
-export function loadUsersFromDisk(): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    if (fs.existsSync(USERS_FILE)) {
-      const content = fs.readFileSync(USERS_FILE, "utf-8");
-      if (content.trim()) {
-        const loaded: User[] = JSON.parse(content);
-        if (Array.isArray(loaded) && loaded.length > 0) {
-          const cleaned = [...loaded];
-
-          // Ensure default Admin user exists and has assigned stages
-          for (const def of DEFAULT_USERS) {
-            const exists = cleaned.find(
-              (u) => u.username.toLowerCase() === def.username.toLowerCase() || u.id === def.id
-            );
-            if (!exists) {
-              cleaned.push(def);
-            } else if (def.assignedStages && (!exists.assignedStages || exists.assignedStages.length === 0)) {
-              exists.assignedStages = def.assignedStages;
-            }
-            if (!exists.plainPassword && def.plainPassword) {
-              exists.plainPassword = def.plainPassword;
-            }
-          }
-          usersDatabase.splice(0, usersDatabase.length, ...cleaned);
-          saveUsersToDisk();
-          logger.info(`Loaded ${usersDatabase.length} users from disk.`);
-          return;
-        }
-      }
-    }
-    // If not found or empty, save defaults
-    saveUsersToDisk();
-  } catch (err) {
-    logger.error("Error loading users from disk", { err });
-  }
-}
-
-export function saveUsersToDisk(): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    const tempFile = `${USERS_FILE}.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
-    const serialized = JSON.stringify(usersDatabase, null, 2);
-    try {
-      fs.writeFileSync(tempFile, serialized, "utf-8");
-      fs.renameSync(tempFile, USERS_FILE);
-    } catch {
-      // Fallback for Windows file locks
-      fs.writeFileSync(USERS_FILE, serialized, "utf-8");
-      try {
-        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-      } catch {}
-    }
-
-    // Also persist to MongoDB Atlas in background
-    saveUsersToMongo(usersDatabase).catch((err) => {
-      logger.error("[MongoDB] Failed to async save users to MongoDB Atlas", { error: err?.message || String(err) });
-    });
-  } catch (err) {
-    logger.error("Error saving users to disk", { err });
-  }
+export function saveUsers(): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) return;
+  saveUsersToPostgres(usersDatabase, revokedUserIds, revokedUsernames).catch((err) => {
+    logger.error("[PostgreSQL] Failed to async save users", { error: err?.message || String(err) });
+  });
 }
 
 /**
- * Synchronize users with MongoDB Atlas
+ * Load users and revoked list from local PostgreSQL, seeding default admin if empty.
  */
-export async function syncUsersWithMongo(): Promise<void> {
-  try {
-    const mongoUsers = await loadUsersFromMongo();
-    if (mongoUsers && Array.isArray(mongoUsers) && mongoUsers.length > 0) {
-      // MongoDB Atlas has users; use MongoDB as the canonical source of truth, but never resurrect revoked/deleted accounts
-      const validUsers = mongoUsers.filter(
-        (u) => !revokedUserIds.has(u.id) && !revokedUsernames.has((u.username || "").toLowerCase())
-      );
-      usersDatabase.splice(0, usersDatabase.length, ...validUsers);
-      saveUsersToDisk();
-      logger.info(`[MongoDB] Successfully loaded ${usersDatabase.length} users from MongoDB Atlas (revoked/deleted excluded).`);
-    } else if (usersDatabase.length > 0) {
-      // Seed MongoDB Atlas only if MongoDB collection is empty
-      const saved = await saveUsersToMongo(usersDatabase);
-      if (saved) {
-        logger.info(`[MongoDB] Seeded MongoDB Atlas with ${usersDatabase.length} users.`);
-      }
-    }
-  } catch (err: any) {
-    logger.error("[MongoDB] Error syncing users with MongoDB", { error: err?.message || String(err) });
-  }
-}
+export async function initUsersDatabase(force = false): Promise<void> {
+  if (usersInitPromise && !force) return usersInitPromise;
 
-// Initialize users & revoked list on load
-loadUsersFromDisk();
-loadRevokedUsersFromDisk();
+  usersInitPromise = (async () => {
+    try {
+      const pgUsersData = await loadUsersFromPostgres();
+      if (!pgUsersData) {
+        usersInitPromise = null;
+        return;
+      }
+
+      revokedUserIds.clear();
+      revokedUsernames.clear();
+      pgUsersData.revokedIds.forEach((id) => revokedUserIds.add(id));
+      pgUsersData.revokedUsernames.forEach((u) => revokedUsernames.add(u.toLowerCase()));
+
+      if (pgUsersData.users.length > 0) {
+        const validUsers: User[] = pgUsersData.users.filter(
+          (u) => !revokedUserIds.has(u.id) && !revokedUsernames.has((u.username || "").toLowerCase())
+        );
+
+        let changed = validUsers.length !== pgUsersData.users.length;
+        for (const def of DEFAULT_USERS) {
+          const exists = validUsers.find(
+            (u) => u.username.toLowerCase() === def.username.toLowerCase() || u.id === def.id
+          );
+          if (!exists) {
+            validUsers.push(def);
+            changed = true;
+          } else {
+            if (def.assignedStages && (!exists.assignedStages || exists.assignedStages.length === 0)) {
+              exists.assignedStages = def.assignedStages;
+              changed = true;
+            }
+            if (!exists.plainPassword && def.plainPassword) {
+              exists.plainPassword = def.plainPassword;
+              changed = true;
+            }
+          }
+        }
+
+        usersDatabase.splice(0, usersDatabase.length, ...validUsers);
+        if (changed) saveUsers();
+        logger.info(`[PostgreSQL] Loaded ${usersDatabase.length} users from local PostgreSQL.`);
+      } else {
+        saveUsers();
+        logger.info(`[PostgreSQL] Seeded local PostgreSQL with ${usersDatabase.length} default user(s).`);
+      }
+    } catch (err: any) {
+      logger.error("[PostgreSQL] Error initializing users", { error: err?.message || String(err) });
+    }
+  })();
+
+  await usersInitPromise;
+}
 
 // ─── Real-Time Session Store ──────────────────────────────────────────────────
 export const activeSessions = new Map<string, UserSession>();
@@ -421,8 +349,7 @@ export function createUser(data: {
   usersDatabase.push(newUser);
   // If this username was previously recorded as revoked, remove it from the revoked list
   revokedUsernames.delete(newUser.username.toLowerCase());
-  saveRevokedUsersToDisk();
-  saveUsersToDisk();
+  saveUsers();
 
   return {
     id: newUser.id,
@@ -490,7 +417,7 @@ export function updateUser(
     user.plainPassword = updates.password.trim();
   }
 
-  saveUsersToDisk();
+  saveUsers();
 
   return {
     id: user.id,
@@ -557,7 +484,7 @@ export function updateUserPermission(userId: string, key: string, value: boolean
     }
   }
 
-  saveUsersToDisk();
+  saveUsers();
 
   const effective = getUserEffectivePermissions(user);
   return {
@@ -582,7 +509,7 @@ export function resetUserPermissions(userId: string): { user: UserRecord; permis
   if (!user) throw new Error("User not found.");
 
   delete user.customPermissions;
-  saveUsersToDisk();
+  saveUsers();
 
   const effective = getUserEffectivePermissions(user);
   return {
@@ -617,7 +544,6 @@ export function deleteUser(id: string): User | null {
   // 1. Immediately record user in revoked sets and persist
   revokedUserIds.add(id);
   revokedUsernames.add(userToDelete.username.toLowerCase());
-  saveRevokedUsersToDisk();
 
   // 2. Terminate all active sessions for this user
   for (const [sessionId, session] of activeSessions.entries()) {
@@ -629,9 +555,9 @@ export function deleteUser(id: string): User | null {
     }
   }
 
-  // 3. Remove user from database and persist to disk & MongoDB
+  // 3. Remove user from database and persist to PostgreSQL
   usersDatabase.splice(index, 1);
-  saveUsersToDisk();
+  saveUsers();
   return userToDelete;
 }
 
@@ -639,7 +565,7 @@ export function updateUserLastLogin(id: string): void {
   const user = findUserById(id);
   if (user) {
     user.lastLoginAt = new Date().toISOString();
-    saveUsersToDisk();
+    saveUsers();
   }
 }
 
@@ -855,7 +781,7 @@ export function verifyAndResetPassword(
   user.passwordHash = hash;
   user.salt = salt;
   user.plainPassword = newPassword.trim();
-  saveUsersToDisk();
+  saveUsers();
 
   // Clean up used OTP
   passwordResetStore.delete(entry.email.toLowerCase());

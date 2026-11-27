@@ -12,7 +12,17 @@ export const envSchema = z.object({
     .string()
     .min(8, "JWT_SECRET must be at least 8 characters long")
     .default("sejal-glass-manufacturing-secret-key-2026"),
-  DATA_DIR: z.string().optional(),
+  DATABASE_URL: z.string().optional(),
+  PGHOST: z.string().default("127.0.0.1"),
+  PGPORT: z
+    .string()
+    .transform((val) => parseInt(val, 10))
+    .or(z.number())
+    .default(5432),
+  PGUSER: z.string().default("postgres"),
+  PGPASSWORD: z.string().default("postgres"),
+  PGDATABASE: z.string().optional(),
+  PGSSL: z.string().optional(),
   SMTP_HOST: z.string().default("smtp.gmail.com"),
   SMTP_PORT: z
     .string()

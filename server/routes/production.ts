@@ -17,8 +17,13 @@ import {
   isBatchUploadHistory,
   isStickerPairMatch,
   isDlguStickerPairMatch,
+  cleanScannedBarcode,
+  isDirectIdentifierMatch,
+  isItemMatchingCode,
+  findMatchingItemsByCode,
+  countPairingBufferUnits,
 } from "../../shared/api";
-import { piDatabase, glassItemsDatabase, productionHistoryDatabase, rejectDatabase, reworkDatabase, notificationsDatabase, createAndBroadcastNotification, saveDatabaseToDisk, loadDatabaseFromDisk } from "./pi";
+import { piDatabase, glassItemsDatabase, productionHistoryDatabase, rejectDatabase, reworkDatabase, notificationsDatabase, createAndBroadcastNotification, saveDatabase } from "./pi";
 import { logger } from "../lib/logger";
 import { verifyToken } from "../lib/auth";
 import { findUserByUsernameOrEmail, getAllUserRecords } from "../lib/users";
@@ -73,163 +78,18 @@ export {
   KNOWN_BARCODE_PREFIXES,
   formatGenericBarcode,
   formatSejalBarcode,
+  cleanScannedBarcode,
+  isDirectIdentifierMatch,
+  isItemMatchingCode,
+  findMatchingItemsByCode,
 };
-
-export function cleanScannedBarcode(rawCode: string): string {
-  if (!rawCode) return "";
-  return String(rawCode)
-    .trim()
-    .replace(/^\][a-zA-Z0-9]{2}/, "") // Strip AIM symbology prefix (e.g. ]C1 for Code 128, ]Q1 for QR)
-    .replace(/^QR[-_:]?/i, "")        // Strip QR- prefix
-    .replace(/^BAR[-_:]?/i, "")       // Strip BAR- prefix
-    .replace(/^#/, "")                // Strip leading #
-    .replace(/[\x00-\x1F\x7F]/g, "")  // Strip non-printable control characters (STX, ETX, CR, LF, etc.)
-    .trim();
-}
-
-export function isItemMatchingCode(item: any, rawCode: string): boolean {
-  if (!item || !rawCode) return false;
-  const clean = cleanScannedBarcode(rawCode);
-  if (!clean) return false;
-
-  const cleanLower = clean.toLowerCase();
-  const digitsOnly = clean.replace(/\D/g, "");
-  const cleanNormalized = clean.replace(/[\s\-_/.]/g, "").toLowerCase();
-
-  // 1. Direct ID & Serial Number match
-  if (item.id && String(item.id).toLowerCase() === cleanLower) return true;
-  if (item.serialNumber) {
-    const s = String(item.serialNumber).toLowerCase();
-    if (s === cleanLower || s.replace(/^#/, "") === cleanLower) return true;
-    const sDigits = s.replace(/\D/g, "");
-    if (/^\d+$/.test(clean) && digitsOnly && sDigits && (sDigits === digitsOnly || sDigits.replace(/^0+/, "") === digitsOnly.replace(/^0+/, ""))) {
-      return true;
-    }
-  }
-
-  // 2. Direct Barcode & QR ID match
-  if (item.barcode) {
-    const b = String(item.barcode).toLowerCase();
-    if (b === cleanLower || b.replace(/^qr[-_:]?/i, "") === cleanLower) return true;
-    if (digitsOnly && b.replace(/\D/g, "") === digitsOnly) return true;
-  }
-  if (item.qrId) {
-    const q = String(item.qrId).toLowerCase();
-    if (q === cleanLower || q.replace(/^qr[-_:]?/i, "") === cleanLower) return true;
-  }
-
-  // 3. Formatted Generic & Sejal Barcode permutations (SFO / PI / Order / Batch with POS / Serial / srNo)
-  const sfoSources = [item.sfoNo, item.orderNo, item.piNumber, item.batchNo].filter(Boolean) as string[];
-  const seqSources = [item.posNo, item.srNo, item.serialNumber ? String(item.serialNumber).replace(/\D/g, "") : ""].filter(Boolean) as (string | number)[];
-
-  const candidatePrefixes = Array.from(new Set([BARCODE_PREFIX, ...KNOWN_BARCODE_PREFIXES, ""]));
-  for (const prefix of candidatePrefixes) {
-    for (const sfo of sfoSources) {
-      for (const seq of seqSources) {
-        const generated = formatGenericBarcode(sfo, seq, prefix);
-        if (generated === clean || generated === digitsOnly) return true;
-      }
-    }
-  }
-
-  // 4. Breakdown of numeric barcodes (Generic prefix + SFO + SEQ)
-  if (digitsOnly.length >= 12) {
-    for (const prefix of candidatePrefixes) {
-      if (prefix && digitsOnly.startsWith(prefix)) {
-        const remainder = digitsOnly.slice(prefix.length);
-        if (remainder.length >= 6) {
-          const seqPart4 = remainder.slice(-4).replace(/^0+/, "");
-          const seqPart3 = remainder.slice(-3).replace(/^0+/, "");
-          const sfoPart4 = remainder.slice(0, -4).replace(/^0+/, "");
-          const sfoPart3 = remainder.slice(0, -3).replace(/^0+/, "");
-
-          const matchesSeq = (seqP: string) =>
-            seqSources.some((seq) => {
-              const cleanSeq = String(seq).replace(/\D/g, "").replace(/^0+/, "");
-              return cleanSeq && cleanSeq === seqP;
-            });
-
-          const matchesSfo = (sfoP: string) =>
-            sfoSources.some((s) => {
-              const cleanS = String(s).replace(/\D/g, "").replace(/^0+/, "");
-              return cleanS && (cleanS === sfoP || cleanS.endsWith(sfoP) || sfoP.endsWith(cleanS));
-            });
-
-          if ((matchesSeq(seqPart4) && matchesSfo(sfoPart4)) || (matchesSeq(seqPart3) && matchesSfo(sfoPart3))) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  // 5. Position (POS) match (e.g. scanned "POS 1", "POS #1", "POS-1", "P1", "#1", or pure numeric "1", "3", "22")
-  if (item.posNo) {
-    const posStr = String(item.posNo).trim().toLowerCase();
-    const posDigits = posStr.replace(/\D/g, "");
-    if (
-      cleanLower === posStr ||
-      cleanLower === `pos ${posStr}` ||
-      cleanLower === `pos #${posStr}` ||
-      cleanLower === `pos-${posStr}` ||
-      cleanLower === `pos${posStr}` ||
-      cleanLower === `#${posStr}` ||
-      cleanLower === `p${posStr}` ||
-      cleanLower === `p-${posStr}` ||
-      cleanLower === `pos.${posStr}` ||
-      cleanLower === `pos. ${posStr}`
-    ) {
-      return true;
-    }
-    // Pure numeric input matching POS (e.g. operator scans or types "3" or "22")
-    if (/^\d+$/.test(clean) && digitsOnly && posDigits && (digitsOnly === posDigits || digitsOnly.replace(/^0+/, "") === posDigits.replace(/^0+/, ""))) {
-      if (digitsOnly.length <= 4) {
-        return true;
-      }
-    }
-  }
-
-  // 6. Glass Code or Item Code match (exact or normalized without spaces)
-  if (item.itemCode) {
-    const ic = String(item.itemCode).trim().toLowerCase();
-    if (ic === cleanLower || ic.replace(/[\s\-_/.]/g, "") === cleanNormalized) return true;
-  }
-  if (item.glassCode) {
-    const gc = String(item.glassCode).trim().toLowerCase();
-    if (gc === cleanLower || gc.replace(/[\s\-_/.]/g, "") === cleanNormalized) return true;
-  }
-
-  // 7. SFO / Order / OB / Batch number match (allows scanning Order/SFO/OB/Batch numbers on stickers)
-  const orderIdentifiers = [
-    { val: item.sfoNo, label: "sfo" },
-    { val: item.orderNo, label: "order" },
-    { val: item.obNo, label: "ob" },
-    { val: item.batchNo, label: "batch" },
-    { val: item.piNumber, label: "pi" },
-  ];
-  for (const ident of orderIdentifiers) {
-    if (ident.val) {
-      const v = String(ident.val).trim().toLowerCase();
-      if (v === cleanLower || `sfo ${v}` === cleanLower || `order ${v}` === cleanLower || `ob ${v}` === cleanLower || `batch ${v}` === cleanLower) {
-        return true;
-      }
-      const vDigits = v.replace(/\D/g, "").replace(/^0+/, "");
-      const inputDigits = digitsOnly.replace(/^0+/, "");
-      if (/^\d+$/.test(clean) && vDigits && inputDigits && vDigits === inputDigits && vDigits.length >= 3) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
 
 export function findBestMatchingItem(
   items: GlassItem[],
   rawCode: string,
   preferredStage?: string
 ): GlassItem | null {
-  const matches = items.filter((item) => isItemMatchingCode(item, rawCode));
+  const matches = findMatchingItemsByCode(items, rawCode);
   if (matches.length === 0) return null;
 
   const normStage = preferredStage?.trim().toLowerCase();
@@ -334,7 +194,7 @@ export const handleScanLookup: RequestHandler = (req, res) => {
   }
 
   const effectiveStage = inferStageFromRequest(req, stage, operator);
-  const matches = glassItemsDatabase.filter((i) => isItemMatchingCode(i, String(code)));
+  const matches = findMatchingItemsByCode(glassItemsDatabase, String(code));
   const normStage = effectiveStage ? effectiveStage.trim().toLowerCase() : undefined;
 
   if (matches.length > 0 && normStage && normStage !== "all" && normStage !== "overview") {
@@ -1188,7 +1048,7 @@ export const handleAdvanceStage: RequestHandler = (req, res) => {
     manualPairDlguPhase2Items();
   }
 
-  saveDatabaseToDisk(false);
+  saveDatabase(false);
   broadcastUpdate("stage_advanced", { count: updatedItems.length });
 
   const formatStageDisplay = (stg: string) => {
@@ -1445,7 +1305,7 @@ export function autoAdvancePairedDguItems(): number {
   });
 
   if (advancedCount > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   return advancedCount;
@@ -1605,7 +1465,7 @@ export function autoAdvancePairedLaminationItems(filterPosNo?: string, filterPi?
   }
 
   if (advancedCount > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   return advancedCount;
@@ -1644,7 +1504,7 @@ export const handlePairLamination: RequestHandler = (req, res) => {
 export const handlePairDgu: RequestHandler = (req, res) => {
   const advancedCount = autoAdvancePairedDguItems();
   if (advancedCount > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
     broadcastUpdate("stage_advanced", { count: advancedCount });
     createAndBroadcastNotification({
       title: "DGU Pairing Completed",
@@ -1741,7 +1601,7 @@ export function autoAdvancePairedDlguItems(filterPosNo?: string, filterPi?: stri
   }
 
   if (advancedCount > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   return advancedCount;
@@ -1751,7 +1611,7 @@ export function autoAdvancePairedDlguItems(filterPosNo?: string, filterPi?: stri
  * Phase 2: Manual DLGU DGU Pairing (Colour outer pane waiting in Pairing buffer + Laminated Clear pane post-Lamination)
  * Triggered MANUALLY by operator via Pair button in Pairing Buffer or barcode scan.
  */
-export function manualPairDlguPhase2Items(filterPosNo?: string, filterPi?: string, operator = "Operator"): number {
+export function manualPairDlguPhase2Items(filterPosNo?: string, filterPi?: string, operator = "Auto-Pairing Engine"): number {
   let advancedCount = 0;
   const usedSerials = new Set<string>();
 
@@ -1882,7 +1742,7 @@ export function manualPairDlguPhase2Items(filterPosNo?: string, filterPi?: strin
   }
 
   if (advancedCount > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   return advancedCount;
@@ -1890,7 +1750,7 @@ export function manualPairDlguPhase2Items(filterPosNo?: string, filterPi?: strin
 
 export const handlePairDlgu: RequestHandler = (req, res) => {
   const { posNo, piNumber, operator } = req.body || {};
-  const cleanOperator = sanitizeString(operator || (req as any).user?.username || "Operator", 100);
+  const cleanOperator = sanitizeString(operator || (req as any).user?.username || "Auto-Pairing Engine", 100);
   const phase1Count = autoAdvancePairedDlguItems(posNo, piNumber);
   const phase2Count = manualPairDlguPhase2Items(posNo, piNumber, cleanOperator);
   const advancedCount = phase1Count + phase2Count;
@@ -1944,7 +1804,7 @@ export const handleAdvanceDlguLamination: RequestHandler = (req, res) => {
 
   // Now that items are sent from Lamination, auto-pair with waiting Colour glass in Pairing Buffer
   const pairedCount = manualPairDlguPhase2Items();
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("stage_advanced", { count: movedCount + pairedCount });
   createAndBroadcastNotification({
     title: "DLGU Sent from Lamination",
@@ -2637,7 +2497,7 @@ export const handleRejectItem: RequestHandler = (req, res) => {
     }
   });
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("item_rejected", {
     serialNumber: allItemsToReject[0].serialNumber,
     serialNumbers: allItemsToReject.map((t) => t.serialNumber),
@@ -3273,7 +3133,7 @@ export const handleReworkItem: RequestHandler = (req, res) => {
     }
   });
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("item_reworked", {
     serialNumber: allItemsToRework[0].serialNumber,
     serialNumbers: allItemsToRework.map((t) => t.serialNumber),
@@ -3484,7 +3344,7 @@ export const handleExcelUpload: RequestHandler = (req, res) => {
     remarks: `Uploaded ${newItems.length} glass items (${newPI.totalSqm} SQM) for ${newPI.customerName || "Customer"}`,
   });
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("excel_uploaded", { piNumber: newPI.piNumber, customerName: newPI.customerName, itemsCount: newPI.itemsCount });
   createAndBroadcastNotification({
     title: `PI #${newPI.piNumber} Registered`,
@@ -4053,7 +3913,7 @@ export const handleStickerUpload: RequestHandler = (req, res) => {
     });
   });
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("sticker_batch_uploaded", { batchIdentifier, totalItems: allNewItems.length });
   createAndBroadcastNotification({
     title: `Batch #${batchNo || batchIdentifier} Uploaded`,
@@ -4129,9 +3989,11 @@ export const handleGetDashboardStats: RequestHandler = (_req, res) => {
   const dguReadyPairs = Math.min(dguColourPanes, dguClearPanes);
   const pendingDGU = dguColourPanes > 0 ? dguColourPanes : dguReadyPairs;
 
-  const pendingPairing = glassItemsDatabase
-    .filter((i) => isUndispatched(i) && i.currentStage === "Pairing" && i.status !== "Completed" && i.status !== "Rejected")
-    .reduce((a, b) => a + (b.qty || 1), 0);
+  const pendingPairing = countPairingBufferUnits(
+    glassItemsDatabase.filter(
+      (i) => isUndispatched(i) && i.currentStage === "Pairing" && i.status !== "Completed" && i.status !== "Rejected"
+    )
+  );
 
   // Finished Items (Pending Dispatch) vs Dispatched Items
   const isDgu = (i: any) => {
@@ -4177,25 +4039,38 @@ export const handleGetDashboardStats: RequestHandler = (_req, res) => {
   const finishedItems = computeUnits(finishedPendingList);
   const dispatchedItems = computeUnits(dispatchedList);
 
-  // Auto-reconcile resolved states for any items that have already completed or advanced past rework
+  // Build O(1) serial lookup once to avoid O(N*M) scans across rejects and reworks
+  const itemBySerial = new Map<string, GlassItem>();
+  const itemSqmLookup = new Map<string, number>();
+  const activeReworkSerials = new Set<string>();
+  const activeRejectSerials = new Set<string>();
+
   glassItemsDatabase.forEach((g) => {
-    if (g.status === "Completed" || g.currentStage === "Finished" || g.status === "In Production") {
+    if (g.serialNumber) {
+      itemBySerial.set(g.serialNumber, g);
+      itemSqmLookup.set(g.serialNumber, g.sqm || 0);
+    }
+    if (g.barcode) {
+      itemSqmLookup.set(g.barcode, g.sqm || 0);
+    }
+    const isCompleted = g.status === "Completed" || g.currentStage === "Finished";
+    if (isCompleted || g.status === "In Production") {
       if ((g as any).isReworking) delete (g as any).isReworking;
-      if ((g as any).isRejected && (g.status === "Completed" || g.currentStage === "Finished")) delete (g as any).isRejected;
+      if ((g as any).isRejected && isCompleted) delete (g as any).isRejected;
+    }
+    const isReworkingItem = g.status === "Reworking" || Boolean((g as any).isReworking);
+    if (isReworkingItem && !isCompleted && g.status !== "Rejected") {
+      activeReworkSerials.add(g.serialNumber);
+    }
+    const isRejectedItem = g.status === "Rejected" || Boolean((g as any).isRejected);
+    if (isRejectedItem && !isCompleted) {
+      activeRejectSerials.add(g.serialNumber);
     }
   });
 
-  const activeReworkSerials = new Set<string>();
-  glassItemsDatabase.forEach((i) => {
-    const isCompleted = i.status === "Completed" || i.currentStage === "Finished";
-    const isReworkingItem = i.status === "Reworking" || Boolean((i as any).isReworking);
-    if (isReworkingItem && !isCompleted && i.status !== "Rejected") {
-      activeReworkSerials.add(i.serialNumber);
-    }
-  });
   reworkDatabase.forEach((rw) => {
     if (!rw.resolved) {
-      const match = glassItemsDatabase.find((g) => g.serialNumber === rw.serialNumber);
+      const match = itemBySerial.get(rw.serialNumber);
       if (match && (match.status === "Completed" || match.currentStage === "Finished" || (match.status === "In Production" && match.currentStage !== rw.targetStage && match.currentStage !== rw.fromStage))) {
         rw.resolved = true;
         rw.status = "Completed";
@@ -4207,17 +4082,9 @@ export const handleGetDashboardStats: RequestHandler = (_req, res) => {
   });
   const reworkItems = activeReworkSerials.size;
 
-  const activeRejectSerials = new Set<string>();
-  glassItemsDatabase.forEach((i) => {
-    const isCompleted = i.status === "Completed" || i.currentStage === "Finished";
-    const isRejectedItem = i.status === "Rejected" || Boolean((i as any).isRejected);
-    if (isRejectedItem && !isCompleted) {
-      activeRejectSerials.add(i.serialNumber);
-    }
-  });
   rejectDatabase.forEach((rej) => {
     if (!rej.resolved) {
-      const match = glassItemsDatabase.find((g) => g.serialNumber === rej.serialNumber);
+      const match = itemBySerial.get(rej.serialNumber);
       if (match && (match.status === "Completed" || match.currentStage === "Finished")) {
         rej.resolved = true;
         rej.status = "Resolved";
@@ -4228,13 +4095,6 @@ export const handleGetDashboardStats: RequestHandler = (_req, res) => {
     }
   });
   const rejectItems = activeRejectSerials.size;
-
-  // Compute user / machine throughput breakdown by stage (stickers count + SQM volume)
-  const itemSqmLookup = new Map<string, number>();
-  glassItemsDatabase.forEach((g) => {
-    if (g.serialNumber) itemSqmLookup.set(g.serialNumber, g.sqm || 0);
-    if (g.barcode) itemSqmLookup.set(g.barcode, g.sqm || 0);
-  });
 
   const userRecords = getAllUserRecords();
   const userLookup = new Map<string, { name: string; username: string }>();
@@ -4335,7 +4195,7 @@ export const handleGetNotifications: RequestHandler = (_req, res) => {
       createdAt: new Date().toISOString(),
     };
     notificationsDatabase.push(defaultNotif);
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   res.json(notificationsDatabase.slice(0, 50));
@@ -4346,7 +4206,7 @@ export const handleMarkAllNotificationsRead: RequestHandler = (_req, res) => {
   notificationsDatabase.forEach((n) => {
     n.read = true;
   });
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("notifications_updated");
   res.json({ success: true, message: "All notifications marked as read" });
 };
@@ -4357,7 +4217,7 @@ export const handleMarkNotificationRead: RequestHandler = (req, res) => {
   const notif = notificationsDatabase.find((n) => n.id === id);
   if (notif) {
     notif.read = true;
-    saveDatabaseToDisk();
+    saveDatabase();
     broadcastUpdate("notifications_updated");
   }
   res.json({ success: true });
@@ -4369,7 +4229,7 @@ export const handleDeleteNotification: RequestHandler = (req, res) => {
   const idx = notificationsDatabase.findIndex((n) => n.id === id);
   if (idx !== -1) {
     notificationsDatabase.splice(idx, 1);
-    saveDatabaseToDisk();
+    saveDatabase();
     broadcastUpdate("notifications_updated");
   }
   res.json({ success: true });
@@ -4378,7 +4238,7 @@ export const handleDeleteNotification: RequestHandler = (req, res) => {
 // Clear all notifications
 export const handleClearAllNotifications: RequestHandler = (_req, res) => {
   notificationsDatabase.length = 0;
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("notifications_updated");
   res.json({ success: true, message: "Notifications cleared" });
 };
@@ -4390,9 +4250,14 @@ export const handleGetReports: RequestHandler = (req, res) => {
 
   // Auto-sync: Ensure all rejected glass items automatically exist in reworkDatabase with remake tickets to Cutting
   let syncChanged = false;
+  const existingReworkSerials = new Set(reworkDatabase.map((rw) => rw.serialNumber));
+  const reportItemBySerial = new Map<string, GlassItem>();
+  glassItemsDatabase.forEach((g) => {
+    if (g.serialNumber) reportItemBySerial.set(g.serialNumber, g);
+  });
   rejectDatabase.forEach((rej) => {
-    const alreadyInRework = reworkDatabase.some((rw) => rw.serialNumber === rej.serialNumber);
-    if (!alreadyInRework && rej.serialNumber) {
+    if (rej.serialNumber && !existingReworkSerials.has(rej.serialNumber)) {
+      existingReworkSerials.add(rej.serialNumber);
       reworkDatabase.push({
         id: `rew-${rej.id || Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
         serialNumber: rej.serialNumber,
@@ -4409,7 +4274,7 @@ export const handleGetReports: RequestHandler = (req, res) => {
       });
       syncChanged = true;
 
-      const item = glassItemsDatabase.find((g) => g.serialNumber === rej.serialNumber);
+      const item = reportItemBySerial.get(rej.serialNumber);
       if (item && item.status !== "Completed" && item.status !== "In Production" && !rej.resolved) {
         item.status = "Reworking";
         item.currentStage = "Cutting";
@@ -4418,7 +4283,7 @@ export const handleGetReports: RequestHandler = (req, res) => {
   });
 
   if (syncChanged) {
-    saveDatabaseToDisk(false);
+    saveDatabase(false);
   }
 
   // If no page param, return all (backward compatible)
@@ -4461,7 +4326,7 @@ export const handleClearDatabase: RequestHandler = (_req, res) => {
   reworkDatabase.length = 0;
   notificationsDatabase.length = 0;
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("database_cleared");
   createAndBroadcastNotification({
     title: "System Reset",
@@ -4525,7 +4390,7 @@ export function cleanupOldAuditRecords(maxAgeDays = 90, maxRecordsPerTable = 100
   const reworksRemoved = initialReworksLen - reworkDatabase.length;
 
   if (historyRemoved > 0 || rejectsRemoved > 0 || reworksRemoved > 0) {
-    saveDatabaseToDisk();
+    saveDatabase();
     logger.info("Data Retention Cleanup", { historyRemoved, rejectsRemoved, reworksRemoved, maxAgeDays });
   }
 
@@ -4541,15 +4406,6 @@ export const handleCleanupDatabase: RequestHandler = (req, res) => {
     ...result,
   });
 };
-
-// Schedule startup data retention cleanup
-setTimeout(() => {
-  try {
-    cleanupOldAuditRecords(90, 1000);
-  } catch (e) {
-    logger.error("Startup cleanup failed", { error: String(e) });
-  }
-}, 1000);
 
 // Delete individual or multiple glass items (piece-wise or sheet-wise)
 export const handleDeleteItems: RequestHandler = (req, res) => {
@@ -4631,7 +4487,7 @@ export const handleDeleteItems: RequestHandler = (req, res) => {
     }
   }
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("stage_advanced", { count: deletedItems.length, action: "delete" });
   broadcastUpdate("item_deleted", { deletedCount: deletedItems.length });
 
@@ -4779,7 +4635,7 @@ export const handleDispatchItems: RequestHandler = (req, res) => {
     }
   }
 
-  saveDatabaseToDisk(true);
+  saveDatabase(true);
   broadcastUpdate("stage_advanced", { count: targetItems.length, action: "dispatch" });
 
   createAndBroadcastNotification({
@@ -5015,7 +4871,7 @@ export const handlePackToRack: RequestHandler = (req, res) => {
     }
   }
 
-  saveDatabaseToDisk(true);
+  saveDatabase(true);
   broadcastUpdate("stage_advanced", { count: packedItems.length, action: "rack_packed", rackNo: cleanRack });
 
   res.json({
@@ -5065,7 +4921,7 @@ export const handleUnpackFromRack: RequestHandler = (req, res) => {
     item.updatedAt = new Date().toISOString();
   }
 
-  saveDatabaseToDisk(true);
+  saveDatabase(true);
   broadcastUpdate("stage_advanced", { count: allToUnpack.length, action: "rack_unpacked" });
 
   res.json({
@@ -5219,7 +5075,7 @@ export const handleSendToFinished: RequestHandler = (req, res) => {
     });
   }
 
-  saveDatabaseToDisk(true);
+  saveDatabase(true);
   broadcastUpdate("stage_advanced", { count: allToSend.length, action: "sent_to_finished" });
 
   res.json({

@@ -43,7 +43,7 @@ import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import { scannerAudio } from "@/lib/audioBeep";
 import { useBarcodeScanner } from "@/hooks/useBarcodeScanner";
-import { cleanScannedBarcode, formatSejalBarcode, generateBarcodeSVG, isItemMatchingCode } from "@/lib/barcode";
+import { cleanScannedBarcode, formatSejalBarcode, generateBarcodeSVG, isDirectIdentifierMatch, isItemMatchingCode } from "@/lib/barcode";
 import {
   isDguGlass,
   isLaminatedGlass,
@@ -1265,29 +1265,32 @@ const handleDirectScan = useCallback(
       const cleanUpper = clean.toUpperCase();
       const cleanLower = clean.toLowerCase();
 
-      // Robust unit row matcher across all panes, barcodes, serials, POS, and formats
-      const doesRowMatchCode = (row: PackingUnitRow) => {
-        // 1. Direct serial match across all panes in this assembled unit
+      // Direct identifier matcher (serial, barcode, id, qrId) so heuristic POS/Order fallbacks never shadow an exact sticker
+      const doesRowMatchDirect = (row: PackingUnitRow) => {
         if (row.allSerials && row.allSerials.some((s) => s.toUpperCase() === cleanUpper || s.toLowerCase() === cleanLower)) {
           return true;
         }
-        // 2. Barcode or code match across all panes in this assembled unit
-        if (
-          row.allPanes &&
-          row.allPanes.some(
-            (p) =>
-              (p.barcode && cleanScannedBarcode(p.barcode).toUpperCase() === cleanUpper) ||
-              (p.serialNumber && p.serialNumber.toUpperCase() === cleanUpper) ||
-              isItemMatchingCode(p, clean)
-          )
-        ) {
-          return true;
-        }
-        // 3. Display barcode match
         if (row.displayBarcode && cleanScannedBarcode(row.displayBarcode).toUpperCase() === cleanUpper) {
           return true;
         }
-        // 4. Primary or partner item fallback
+        const panes = [
+          ...(row.allPanes || []),
+          row.primaryItem,
+          ...(row.partnerItem ? [row.partnerItem] : []),
+          ...(row.partnerItems || []),
+        ].filter(Boolean);
+        return panes.some((p) => isDirectIdentifierMatch(p, clean));
+      };
+
+      // Robust unit row matcher across all panes, barcodes, serials, POS, and formats
+      const doesRowMatchCode = (row: PackingUnitRow) => {
+        if (doesRowMatchDirect(row)) return true;
+        if (
+          row.allPanes &&
+          row.allPanes.some((p) => isItemMatchingCode(p, clean))
+        ) {
+          return true;
+        }
         if (
           isItemMatchingCode(row.primaryItem, clean) ||
           (row.partnerItem && isItemMatchingCode(row.partnerItem, clean)) ||
@@ -1307,17 +1310,22 @@ const handleDirectScan = useCallback(
         return false;
       };
 
-      // 1. Check Pending Rack queue first (incoming from DGU / Lamination without a physical rack yet)
-      let matchedPendingRow = pendingUnitRows.find(doesRowMatchCode);
+      // 1. Check Pending Rack queue first (direct barcode/serial match across all queues before heuristic fallback)
+      let matchedPendingRow = pendingUnitRows.find(doesRowMatchDirect);
 
-      // Fallback A: Check pendingRackItems directly in case unitRows didn't catch a lone/un-grouped piece
+      // Fallback A: Direct item match in pendingRackItems / raw items before heuristic row matches
       if (!matchedPendingRow) {
-        const directPendingItem = pendingRackItems.find(
-          (it) =>
-            isItemMatchingCode(it, clean) ||
-            (it.barcode && cleanScannedBarcode(it.barcode).toUpperCase() === cleanUpper) ||
-            (it.serialNumber && it.serialNumber.toUpperCase() === cleanUpper)
-        );
+        const directPendingItem =
+          pendingRackItems.find((it) => isDirectIdentifierMatch(it, clean)) ||
+          items.find(
+            (it) =>
+              it.status !== "Rejected" &&
+              !it.sentToFinished &&
+              !it.isDispatched &&
+              (!it.packingRackNo || !it.packingRackNo.trim()) &&
+              (type === "IGU" ? isPackingIguItem(it) : isPackingLamiItem(it)) &&
+              isDirectIdentifierMatch(it, clean)
+          );
         if (directPendingItem) {
           matchedPendingRow =
             pendingUnitRows.find((r) => r.allItemIds?.includes(directPendingItem.id)) ||
@@ -1325,23 +1333,39 @@ const handleDirectScan = useCallback(
         }
       }
 
-      // Fallback B: Scan across raw items list for any pending packing piece awaiting a rack
-      if (!matchedPendingRow) {
-        const rawPendingItem = items.find(
-          (it) =>
-            it.status !== "Rejected" &&
-            !it.sentToFinished &&
-            !it.isDispatched &&
-            (!it.packingRackNo || !it.packingRackNo.trim()) &&
-            (type === "IGU" ? isPackingIguItem(it) : isPackingLamiItem(it)) &&
-            (isItemMatchingCode(it, clean) ||
-              (it.barcode && cleanScannedBarcode(it.barcode).toUpperCase() === cleanUpper) ||
-              (it.serialNumber && it.serialNumber.toUpperCase() === cleanUpper))
-        );
-        if (rawPendingItem) {
-          matchedPendingRow =
-            pendingUnitRows.find((r) => r.allItemIds?.includes(rawPendingItem.id)) ||
-            buildUnitRowsFromItems([rawPendingItem])[0];
+      // Check if an exact barcode/serial match already exists on an active rack or history before heuristic fallback
+      const directRackedRow =
+        unitRows.find((row) => row.rackNo === selectedRack && doesRowMatchDirect(row)) ||
+        unitRows.find(doesRowMatchDirect);
+      const directHistoryRow = !directRackedRow ? allHistoryUnitRows.find(doesRowMatchDirect) : undefined;
+
+      if (!matchedPendingRow && !directRackedRow && !directHistoryRow) {
+        matchedPendingRow = pendingUnitRows.find(doesRowMatchCode);
+
+        if (!matchedPendingRow) {
+          const directPendingItem = pendingRackItems.find((it) => isItemMatchingCode(it, clean));
+          if (directPendingItem) {
+            matchedPendingRow =
+              pendingUnitRows.find((r) => r.allItemIds?.includes(directPendingItem.id)) ||
+              buildUnitRowsFromItems([directPendingItem])[0];
+          }
+        }
+
+        if (!matchedPendingRow) {
+          const rawPendingItem = items.find(
+            (it) =>
+              it.status !== "Rejected" &&
+              !it.sentToFinished &&
+              !it.isDispatched &&
+              (!it.packingRackNo || !it.packingRackNo.trim()) &&
+              (type === "IGU" ? isPackingIguItem(it) : isPackingLamiItem(it)) &&
+              isItemMatchingCode(it, clean)
+          );
+          if (rawPendingItem) {
+            matchedPendingRow =
+              pendingUnitRows.find((r) => r.allItemIds?.includes(rawPendingItem.id)) ||
+              buildUnitRowsFromItems([rawPendingItem])[0];
+          }
         }
       }
 
@@ -1355,6 +1379,7 @@ const handleDirectScan = useCallback(
       }
 
       const findRackedMatch = () =>
+        directRackedRow ||
         unitRows.find((row) => row.rackNo === selectedRack && doesRowMatchCode(row)) ||
         unitRows.find(doesRowMatchCode);
 
@@ -1415,7 +1440,7 @@ const handleDirectScan = useCallback(
       }
 
       // Check if it was already sent to Finished or dispatched
-      const alreadyFinished = allHistoryUnitRows.find(doesRowMatchCode);
+      const alreadyFinished = directHistoryRow || allHistoryUnitRows.find(doesRowMatchCode);
       if (alreadyFinished) {
         scannerAudio.playSuccess();
         toast.info(
@@ -1462,7 +1487,7 @@ useBarcodeScanner({
   priority: 10,
   ignoreWhenInputFocused: false,
   maxIntervalMs: 350,
-  duplicateCooldownMs: 1200,
+  duplicateCooldownMs: 400,
 });
 
 return (

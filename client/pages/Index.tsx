@@ -67,7 +67,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { PIMaster, GlassItem, DashboardStats, UserRole, ProductionStage, SystemNotification, RejectRecord, ReworkRecord } from "@shared/api";
+import { PIMaster, GlassItem, DashboardStats, UserRole, ProductionStage, SystemNotification, RejectRecord, ReworkRecord, countPairingBufferUnits } from "@shared/api";
 import { TableHorizontalScrollWrapper } from "@/components/TableHorizontalScrollWrapper";
 import { ProductionStageView } from "@/components/ProductionStageView";
 import { SettingsView } from "@/components/SettingsView";
@@ -408,7 +408,7 @@ export default function Index() {
   const pendingFetchRef = useRef(false);
   const streamDebounceRef = useRef<NodeJS.Timeout | null>(null);
 
-  const fetchData = async (silent = false) => {
+  const fetchData = async (silent = false, options?: { skipNotifications?: boolean }) => {
     if (isFetchingRef.current) {
       pendingFetchRef.current = true;
       return;
@@ -416,11 +416,14 @@ export default function Index() {
     isFetchingRef.current = true;
     if (!silent) setLoading(true);
     try {
-      const [dashRes, piRes, notifRes] = await Promise.all([
+      const requests: Promise<Response>[] = [
         fetch("/api/production/dashboard"),
         fetch("/api/pi"),
-        fetch("/api/notifications"),
-      ]);
+      ];
+      if (!options?.skipNotifications) {
+        requests.push(fetch("/api/notifications"));
+      }
+      const [dashRes, piRes, notifRes] = await Promise.all(requests);
 
       if (dashRes.ok) {
         const dashData = await dashRes.json();
@@ -437,7 +440,7 @@ export default function Index() {
         }
       }
       if (piRes.ok) setPis(await piRes.json());
-      if (notifRes.ok) {
+      if (notifRes && notifRes.ok) {
         const serverNotifs = await notifRes.json();
         if (Array.isArray(serverNotifs)) {
           setNotifications(serverNotifs);
@@ -567,8 +570,8 @@ export default function Index() {
       const handleStreamUpdate = () => {
         if (streamDebounceRef.current) clearTimeout(streamDebounceRef.current);
         streamDebounceRef.current = setTimeout(() => {
-          fetchData(true);
-        }, 400);
+          fetchData(true, { skipNotifications: true });
+        }, 650);
       };
 
       eventSource.addEventListener("system_notification", (e: any) => {
@@ -1014,21 +1017,17 @@ export default function Index() {
           : [];
 
         const stickerQty = parseInt(String(matchedItem.lineQty || matchedItem.qty || 1), 10) || 1;
-        const totalMatching = Math.max(
-          stickerQty,
-          barcodeSiblings.length,
-          barcodeSiblings.reduce((sum, g) => sum + (parseInt(String(g.qty || 1), 10) || 1), 0),
-          scanEval.totalMatching || 1
-        );
+        const siblingPieces = barcodeSiblings.length > 0
+          ? Math.max(barcodeSiblings.length, barcodeSiblings.reduce((sum, g) => sum + (parseInt(String(g.qty || 1), 10) || 1), 0))
+          : 0;
+        const totalMatching = siblingPieces > 0 ? siblingPieces : Math.max(stickerQty, scanEval.totalMatching || 1);
 
         const inStageSiblings = barcodeSiblings.filter(
           (g) => g.currentStage?.toLowerCase() === currentStage.toLowerCase()
         );
-        const remainingBeforeAdvance = Math.max(
-          inStageSiblings.length,
-          inStageSiblings.reduce((sum, g) => sum + (parseInt(String(g.qty || 1), 10) || 1), 0),
-          scanEval.remainingInStage || 1
-        );
+        const remainingBeforeAdvance = barcodeSiblings.length > 0
+          ? Math.max(inStageSiblings.length, inStageSiblings.reduce((sum, g) => sum + (parseInt(String(g.qty || 1), 10) || 1), 0))
+          : Math.max(scanEval.remainingInStage || 1, 1);
         const remainingAfter = Math.max(0, remainingBeforeAdvance - 1);
         const stickerIndex = totalMatching > 1 ? Math.min(totalMatching, totalMatching - remainingAfter) : 1;
 
@@ -1200,7 +1199,7 @@ export default function Index() {
   useBarcodeScanner({
     enabled: true,
     priority: 0,
-    duplicateCooldownMs: 1800,
+    duplicateCooldownMs: 400,
     onScan: handleGlobalScan,
   });
 
@@ -1691,14 +1690,7 @@ export default function Index() {
     const totalItems = items.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const cuttingCount = cuttingItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const polishingCount = polishingItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);
-    const dlguPhase2ClearPairingCount = Math.ceil(
-      pairingItems.filter((i) => isDlguGlass(i) && !isColour(i) && (i.completedStages?.includes("Lamination") || i.dlguPhase === "DguPairing"))
-        .reduce((acc, curr) => acc + (curr.qty || 1), 0) / 2
-    );
-    const otherPairingCount = pairingItems
-      .filter((i) => !(isDlguGlass(i) && !isColour(i) && (i.completedStages?.includes("Lamination") || i.dlguPhase === "DguPairing")))
-      .reduce((acc, curr) => acc + (curr.qty || 1), 0);
-    const pairingCount = dlguPhase2ClearPairingCount + otherPairingCount;
+    const pairingCount = countPairingBufferUnits(pairingItems);
     const dguCount = dguItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const laminationCount = laminationItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);
     const finishedCount = finishedItems.reduce((acc, curr) => acc + (curr.qty || 1), 0);

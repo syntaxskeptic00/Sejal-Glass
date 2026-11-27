@@ -1,13 +1,9 @@
 import { RequestHandler } from "express";
-import fs from "fs";
-import path from "path";
-import { GlassItem, PIMaster, ProductionHistory, RejectRecord, ReworkRecord, ProductionStage, SystemNotification, BARCODE_PREFIX, formatGenericBarcode, COLOURED_COATED_GLASS_REGEX, isGlassTypeColour, isDlguGlass, isDguGlass, isLaminatedGlass } from "../../shared/api";
+import { GlassItem, PIMaster, ProductionHistory, RejectRecord, ReworkRecord, ProductionStage, SystemNotification, BARCODE_PREFIX, formatGenericBarcode, COLOURED_COATED_GLASS_REGEX, isDlguGlass, isDguGlass, isLaminatedGlass } from "../../shared/api";
 import { broadcastUpdate } from "./production";
 import { logger } from "../lib/logger";
-import { loadProductionFromMongo, saveProductionToMongo } from "../lib/mongodb";
+import { loadProductionFromPostgres, saveProductionToPostgres } from "../lib/postgres";
 
-const DATA_DIR = path.resolve(process.cwd(), "server/data");
-const DATA_FILE = path.join(DATA_DIR, "db.json");
 
 // Persistence store initialized from disk
 export const piDatabase: PIMaster[] = [];
@@ -47,535 +43,476 @@ interface PersistedData {
   productionHistoryDatabase: ProductionHistory[];
   rejectDatabase: RejectRecord[];
   reworkDatabase: ReworkRecord[];
-  notificationsDatabase?: SystemNotification[];
+  notificationsDatabase: SystemNotification[];
 }
 
 let isDbLoaded = false;
+let initDbPromise: Promise<void> | null = null;
 let saveDebounceTimer: NodeJS.Timeout | null = null;
 
-export function loadDatabaseFromDisk(force = false): void {
-  if (isDbLoaded && !force) return;
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+/** Build an O(N) lookup from PI key variants to matching glass items. */
+function buildPiItemsLookup(): (pi: PIMaster) => GlassItem[] {
+  const byPiId = new Map<string, GlassItem[]>();
+  const byPiNum = new Map<string, GlassItem[]>();
+  const byBatchNo = new Map<string, GlassItem[]>();
+  const bySfoNo = new Map<string, GlassItem[]>();
+
+  const pushToMap = (map: Map<string, GlassItem[]>, key: string | undefined, item: GlassItem) => {
+    if (!key) return;
+    let list = map.get(key);
+    if (!list) {
+      list = [];
+      map.set(key, list);
     }
-    if (fs.existsSync(DATA_FILE)) {
-      const content = fs.readFileSync(DATA_FILE, "utf-8");
-      if (content.trim()) {
-        const parsed: Partial<PersistedData> = JSON.parse(content);
-        piDatabase.splice(0, piDatabase.length, ...(Array.isArray(parsed.piDatabase) ? parsed.piDatabase : []));
-        glassItemsDatabase.splice(0, glassItemsDatabase.length, ...(Array.isArray(parsed.glassItemsDatabase) ? parsed.glassItemsDatabase : []));
-        let dataChanged = false;
-        // Ensure laminated glass items include Pairing in their processRoute before Lamination
-        glassItemsDatabase.forEach((item) => {
-          if (!Array.isArray(item.processRoute)) return;
-          const descLower = `${item.glassType || ""} ${item.glassCode || ""}`.toLowerCase();
-          const isLaminated = item.processRoute.includes("Lamination") || descLower.includes("lam") || descLower.includes("pvb") || descLower.includes("sgp");
-          if (isLaminated && !item.processRoute.includes("Pairing")) {
-            const lamIdx = item.processRoute.indexOf("Lamination");
-            if (lamIdx >= 0) {
-              item.processRoute.splice(lamIdx, 0, "Pairing");
-            } else {
-              item.processRoute.unshift("Pairing");
-            }
-            if (item.currentStage === "Lamination" && !item.completedStages?.includes("Pairing")) {
-              item.currentStage = "Pairing";
-            }
-          }
-        });
+    list.push(item);
+  };
 
-        // Auto-heal unpaired DGU/Lamination items that jumped to DGU or Finished without a partner pane
-        glassItemsDatabase.forEach((item) => {
-          if (!Array.isArray(item.processRoute) || !item.processRoute.includes("Pairing")) return;
-          if (item.currentStage === "Cutting") return;
-
-          if (item.currentStage === "DGU" || item.currentStage === "Finished" || item.status === "Completed") {
-            const isDgu = item.glassCategory === "DGU" || item.processRoute.includes("DGU");
-            const isCol = item.colorOrClear === "Colour" || String(item.category || "").toLowerCase().includes("colour");
-
-            const hasPartner = glassItemsDatabase.some((other) => {
-              if (other.id === item.id) return false;
-              if (other.status === "Rejected") return false;
-              if ((item as any).dguPairId && (other as any).dguPairId === (item as any).dguPairId) return true;
-              const isOtherCol = other.colorOrClear === "Colour" || String(other.category || "").toLowerCase().includes("colour");
-              if (isDgu && isOtherCol === isCol) return false;
-              if (other.posNo && item.posNo && String(other.posNo).trim() !== String(item.posNo).trim()) return false;
-              if (Math.abs((other.width || 0) - (item.width || 0)) >= 2) return false;
-              if (Math.abs((other.height || 0) - (item.height || 0)) >= 2) return false;
-              return other.currentStage === "DGU" || other.currentStage === "Finished" || other.status === "Completed";
-            });
-
-            if (!hasPartner) {
-              logger.warn(`[Auto-Heal] Resetting unpaired glass pane ${item.serialNumber} (${item.barcode}) from ${item.currentStage} back to Pairing Buffer.`);
-              item.currentStage = "Pairing";
-              item.status = "Pending";
-              item.completedStages = ["Cutting"];
-              delete (item as any).isDguReduced;
-              delete (item as any).dguPairId;
-              delete (item as any).lamPairId;
-              dataChanged = true;
-            }
-          }
-        });
-
-
-        // Normalize batches: 1 PDF is strictly 100% Colour or 100% Clear (never Mixed)
-        const colourRegex = COLOURED_COATED_GLASS_REGEX;
-
-        // Auto-heal invalid barcodes (e.g. "WIDTHHEIGHT" or non-digit header artifacts)
-        const repairedBarcodeMap = new Map<string, string>();
-        glassItemsDatabase.forEach((item, idx) => {
-          const b = String(item.barcode || "").trim();
-          if (!b || /width|height|order|customer|project|batch|glass/i.test(b) || /^[A-Z]+$/i.test(b) || !/\d/.test(b)) {
-            const cleanSfo = String(item.sfoNo || item.piNumber || "1344").replace(/[^0-9]/g, "");
-            const numPart = item.serialNumber ? String(item.serialNumber).replace(/\D/g, "") : "";
-            const seqPad = (numPart || String(idx + 1)).padStart(4, "0").slice(-4);
-            const fixedBarcode = formatGenericBarcode(cleanSfo, seqPad, BARCODE_PREFIX);
-            item.barcode = fixedBarcode;
-            item.qrId = `QR-${fixedBarcode}`;
-            if (item.serialNumber) {
-              repairedBarcodeMap.set(item.serialNumber, fixedBarcode);
-            }
-            dataChanged = true;
-          }
-        });
-
-        piDatabase.forEach((pi) => {
-          const batchItems = glassItemsDatabase.filter(
-            (item) => item.piId === pi.id || (item.piNumber && item.piNumber === pi.piNumber)
-          );
-
-          const batchFullText = (
-            (pi.fileName || "") + " " +
-            (pi.glassDescription || "") + " " +
-            ((pi as any).remarks || "") + " " +
-            batchItems.map((i) => `${i.glassType || ""} ${i.glassCode || ""} ${i.category || ""} ${i.glassColor || ""} ${i.remarks || ""}`).join(" ")
-          ).toLowerCase();
-
-          const hasBatchColourKeyword = colourRegex.test(batchFullText);
-          const hasBatchClearKeyword = /clear/i.test(batchFullText);
-
-          let batchFinish: "Colour" | "Clear" = "Clear";
-          if (hasBatchColourKeyword) {
-            batchFinish = "Colour";
-          } else if (pi.colorOrClear === "Colour" || (pi.colorOrClear as any) === "Color" || pi.finish === "Colour") {
-            batchFinish = "Colour";
-          } else if (pi.colorOrClear === "Clear" || pi.finish === "Clear") {
-            batchFinish = "Clear";
-          } else if (hasBatchClearKeyword) {
-            batchFinish = "Clear";
-          } else {
-            const clearCount = batchItems.filter((item) => item.colorOrClear === "Clear" || /clear/i.test(item.glassColor || "")).length;
-            const colourCount = batchItems.filter((item) => item.colorOrClear === "Colour" || (item.colorOrClear as any) === "Color" || (colourRegex.test(item.glassColor || "") && !/clear/i.test(item.glassColor || ""))).length;
-            batchFinish = colourCount > clearCount ? "Colour" : "Clear";
-          }
-
-          if (pi.colorOrClear !== batchFinish || pi.finish !== batchFinish) {
-            pi.colorOrClear = batchFinish;
-            pi.finish = batchFinish;
-            dataChanged = true;
-          }
-
-          batchItems.forEach((item) => {
-            if (item.colorOrClear !== batchFinish || item.finish !== batchFinish) {
-              item.colorOrClear = batchFinish;
-              item.finish = batchFinish;
-              dataChanged = true;
-            }
-            if (batchFinish === "Colour" && (!item.glassColor || item.glassColor === "Clear Glass" || item.glassColor === "Clear Float")) {
-              item.glassColor = pi.glassColor || "Coloured Glass";
-              dataChanged = true;
-            } else if (batchFinish === "Clear" && (!item.glassColor || item.glassColor === "Coloured Glass")) {
-              item.glassColor = "Clear Glass";
-              dataChanged = true;
-            }
-          });
-
-          // Ensure proformaInvNo is distinct from batchNo if items have a distinct orderNo
-          const distinctOrder = batchItems.find(
-            (i) => i.orderNo && i.orderNo !== pi.batchNo && i.orderNo !== pi.piNumber
-          )?.orderNo;
-          if (distinctOrder && (!pi.proformaInvNo || pi.proformaInvNo === pi.piNumber || pi.proformaInvNo === pi.batchNo)) {
-            pi.proformaInvNo = distinctOrder;
-            dataChanged = true;
-          }
-
-          // Normalize glass category (Lamination vs DGU)
-          // Interlayer specs (PVB, SGP, EVA, LAM) without spacers belong strictly to Lamination
-          const batchText = (
-            (pi.fileName || "") + " " +
-            (pi.glassDescription || "") + " " +
-            ((pi as any).remarks || "") + " " +
-            batchItems.map((i) => `${i.glassType || ""} ${i.glassCode || ""} ${i.category || ""} ${i.remarks || ""} ${i.makeup || ""}`).join(" ")
-          ).toLowerCase();
-
-          const isKnownLamBatch =
-            pi.piNumber === "5301" ||
-            pi.piNumber === "1620" ||
-            (pi as any).batchNo === "5301" ||
-            (pi as any).batchNo === "1620" ||
-            (pi.fileName || "").toLowerCase().includes("10 mm clear") ||
-            (pi.fileName || "").toLowerCase().includes("12 mm clear");
-          const hasInterlayer = isKnownLamBatch || /\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(batchText);
-          const hasSpacer = !isKnownLamBatch && /spacer|dgu|igu/i.test(batchText);
-
-          let batchCat: "DGU" | "Lamination" | "DLGU" = pi.glassCategory === "DLGU" ? "DLGU" : (pi.glassCategory === "Lamination" ? "Lamination" : "DGU");
-          if (pi.glassCategory === "DLGU" || (hasInterlayer && hasSpacer)) {
-            batchCat = "DLGU";
-          } else if (hasInterlayer && !hasSpacer) {
-            batchCat = "Lamination";
-          } else if (hasSpacer) {
-            batchCat = "DGU";
-          }
-
-          if (pi.glassCategory !== batchCat) {
-            pi.glassCategory = batchCat;
-            dataChanged = true;
-          }
-
-          batchItems.forEach((item) => {
-            // Preserve explicit category if set; otherwise use batch category
-            const itemText = `${item.glassType || ""} ${item.glassCode || ""} ${item.remarks || ""} ${item.makeup || ""} ${(item as any).stickerRoute || ""}`.toLowerCase();
-            const isItemDlgu = item.glassCategory === "DLGU" || batchCat === "DLGU" || (/spacer|dgu|igu/i.test(itemText) && /\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText));
-            const isItemLam = !isItemDlgu && (item.glassCategory === "Lamination" || (/\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText) && !/spacer|dgu|igu/i.test(itemText)));
-            const isItemDgu = !isItemDlgu && (item.glassCategory === "DGU" || /spacer|dgu|igu/i.test(itemText));
-            const resolvedCat: "DGU" | "Lamination" | "DLGU" = isItemDlgu ? "DLGU" : (isItemLam && !isItemDgu ? "Lamination" : (isItemDgu ? "DGU" : batchCat));
-
-            if (item.glassCategory !== resolvedCat) {
-              item.glassCategory = resolvedCat;
-              dataChanged = true;
-            }
-
-            const hasPolish = (item as any).hasPolish === true || /\bpolish\b/i.test(itemText) || /\bpolished\b/i.test(itemText) || (item.currentStage === "Polishing");
-
-            let expectedRoute: ProductionStage[];
-            if (resolvedCat === "DLGU") {
-              const isLamPane = item.colorOrClear === "Clear" || /lam|laminated|6mm clear/i.test(itemText);
-              expectedRoute = isLamPane
-                ? (hasPolish
-                  ? ["Cutting", "Polishing", "Pairing", "Lamination", "Pairing", "DGU", "Finished"]
-                  : ["Cutting", "Pairing", "Lamination", "Pairing", "DGU", "Finished"])
-                : (hasPolish
-                  ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
-                  : ["Cutting", "Pairing", "DGU", "Finished"]);
-              if (!item.dlguPhase) {
-                item.dlguPhase = isLamPane ? "LamPairing" : "DguPairing";
-                dataChanged = true;
-              }
-            } else if (resolvedCat === "Lamination") {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Pairing", "Lamination", "Finished"]
-                : ["Cutting", "Pairing", "Lamination", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            } else if (resolvedCat === "DGU") {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
-                : ["Cutting", "Pairing", "DGU", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            } else {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Finished"]
-                : ["Cutting", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            }
-
-            // Only update route if item is at Cutting or already has Polishing, to avoid disrupting downstream items
-            const isAdvancedNonPolish = item.currentStage && item.currentStage !== "Cutting" && item.currentStage !== "Polishing";
-            if (!isAdvancedNonPolish && JSON.stringify(item.processRoute) !== JSON.stringify(expectedRoute)) {
-              item.processRoute = expectedRoute;
-              dataChanged = true;
-            }
-          });
-        });
-
-        // Also normalize any remaining glassItems grouped by piId or piNumber (never generic batchNo)
-        const orphanBatches = new Map<string, GlassItem[]>();
-        glassItemsDatabase.forEach((item) => {
-          const key = item.piId || item.piNumber || "default";
-          if (!orphanBatches.has(key)) orphanBatches.set(key, []);
-          orphanBatches.get(key)!.push(item);
-        });
-        orphanBatches.forEach((items) => {
-          const batchText = items.map((i) => `${i.glassType || ""} ${i.glassCode || ""} ${i.glassColor || ""}`).join(" ").toLowerCase();
-          const hasColour = colourRegex.test(batchText);
-          const clearCount = items.filter((item) => item.colorOrClear === "Clear" || /clear/i.test(item.glassColor || "")).length;
-          const colourCount = items.filter((item) => item.colorOrClear === "Colour" || (item.colorOrClear as any) === "Color" || (colourRegex.test(item.glassColor || "") && !/clear/i.test(item.glassColor || ""))).length;
-          const finish: "Colour" | "Clear" = hasColour || colourCount > clearCount ? "Colour" : "Clear";
-
-          items.forEach((item) => {
-            if (item.colorOrClear !== finish || item.finish !== finish) {
-              item.colorOrClear = finish;
-              item.finish = finish;
-              dataChanged = true;
-            }
-            if (finish === "Clear" && item.glassColor === "Coloured Glass") {
-              item.glassColor = "Clear Glass";
-              dataChanged = true;
-            } else if (finish === "Colour" && (item.glassColor === "Clear Glass" || item.glassColor === "Clear Float")) {
-              item.glassColor = "Coloured Glass";
-              dataChanged = true;
-            }
-
-            const itemText = `${item.glassType || ""} ${item.glassCode || ""} ${item.remarks || ""} ${item.makeup || ""} ${(item as any).stickerRoute || ""}`.toLowerCase();
-            const isItemDlgu = item.glassCategory === "DLGU" || (/spacer|dgu|igu/i.test(itemText) && /\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText));
-            const isItemLam = !isItemDlgu && (item.glassCategory === "Lamination" || (/\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText) && !/spacer|dgu|igu/i.test(itemText)));
-            const isItemDgu = !isItemDlgu && (item.glassCategory === "DGU" || /spacer|dgu|igu/i.test(itemText));
-            const resolvedCat: "DGU" | "Lamination" | "DLGU" = isItemDlgu ? "DLGU" : (isItemLam && !isItemDgu ? "Lamination" : (isItemDgu ? "DGU" : (item.glassCategory || "DGU")));
-
-            if (item.glassCategory !== resolvedCat) {
-              item.glassCategory = resolvedCat;
-              dataChanged = true;
-            }
-
-            const hasPolish = (item as any).hasPolish === true || /\bpolish\b/i.test(itemText) || /\bpolished\b/i.test(itemText) || (item.currentStage === "Polishing");
-
-            let expectedRoute: ProductionStage[];
-            if (resolvedCat === "DLGU") {
-              const isLamPane = item.colorOrClear === "Clear" || /lam|laminated|6mm clear/i.test(itemText);
-              expectedRoute = isLamPane
-                ? (hasPolish
-                  ? ["Cutting", "Polishing", "Pairing", "Lamination", "Pairing", "DGU", "Finished"]
-                  : ["Cutting", "Pairing", "Lamination", "Pairing", "DGU", "Finished"])
-                : (hasPolish
-                  ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
-                  : ["Cutting", "Pairing", "DGU", "Finished"]);
-              if (!item.dlguPhase) {
-                item.dlguPhase = isLamPane ? "LamPairing" : "DguPairing";
-                dataChanged = true;
-              }
-            } else if (resolvedCat === "Lamination") {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Pairing", "Lamination", "Finished"]
-                : ["Cutting", "Pairing", "Lamination", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            } else if (resolvedCat === "DGU") {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
-                : ["Cutting", "Pairing", "DGU", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            } else {
-              expectedRoute = hasPolish
-                ? ["Cutting", "Polishing", "Finished"]
-                : ["Cutting", "Finished"];
-              if (item.dlguPhase) {
-                delete item.dlguPhase;
-                dataChanged = true;
-              }
-            }
-
-            // Only update route if item is at Cutting or already has Polishing, to avoid disrupting downstream items
-            const isAdvancedNonPolish = item.currentStage && item.currentStage !== "Cutting" && item.currentStage !== "Polishing";
-            if (!isAdvancedNonPolish && JSON.stringify(item.processRoute) !== JSON.stringify(expectedRoute)) {
-              item.processRoute = expectedRoute;
-              dataChanged = true;
-            }
-          });
-        });
-
-        // Synchronize paired DGU / DLGU partner panes that were assembled and finished together
-        const finishedItems = glassItemsDatabase.filter((i) => i.currentStage === "Finished" && i.status !== "Rejected");
-        finishedItems.forEach((fin) => {
-          if (fin.glassCategory === "DLGU" || fin.glassCategory === "DGU") {
-            const finPairId = (fin as any).lamPairId;
-            glassItemsDatabase.forEach((other) => {
-              if (other.id !== fin.id && other.currentStage === "DGU") {
-                const samePair = (finPairId && (other as any).lamPairId === finPairId) ||
-                  (other.posNo === fin.posNo && other.width === fin.width && other.height === fin.height && (other.piId === fin.piId || other.piNumber === fin.piNumber || other.orderNo === fin.orderNo));
-                if (samePair) {
-                  other.currentStage = "Finished";
-                  other.status = "Completed";
-                  if (!other.completedStages.includes("DGU")) other.completedStages.push("DGU");
-                  other.updatedAt = new Date().toISOString();
-                  dataChanged = true;
-                }
-              }
-            });
-          }
-        });
-
-        // Update completed counts on PI masters
-        piDatabase.forEach((pi) => {
-          const cleanId = (pi.id || "").replace(/^STK-/i, "");
-          const cleanPiNo = (pi.piNumber || "").replace(/^STK-/i, "");
-          const piItems = glassItemsDatabase.filter(
-            (i) => i.piId === pi.id || i.piNumber === pi.piNumber || i.piId === cleanId || i.piNumber === cleanPiNo
-          );
-          if (piItems.length > 0) {
-            const comp = piItems.filter(isItemCompleted).length;
-            if (pi.completedItemsCount !== comp) {
-              pi.completedItemsCount = comp;
-              dataChanged = true;
-            }
-            if (comp >= piItems.length && comp > 0 && pi.status !== "Completed") {
-              pi.status = "Completed";
-              dataChanged = true;
-            } else if (comp < piItems.length && pi.status === "Completed") {
-              pi.status = "In Production";
-              dataChanged = true;
-            }
-          }
-        });
-
-        if (dataChanged) {
-          saveDatabaseToDisk();
-        }
-
-        productionHistoryDatabase.splice(0, productionHistoryDatabase.length, ...(Array.isArray(parsed.productionHistoryDatabase) ? parsed.productionHistoryDatabase : []));
-        rejectDatabase.splice(0, rejectDatabase.length, ...(Array.isArray(parsed.rejectDatabase) ? parsed.rejectDatabase : []));
-        reworkDatabase.splice(0, reworkDatabase.length, ...(Array.isArray(parsed.reworkDatabase) ? parsed.reworkDatabase : []));
-        notificationsDatabase.splice(0, notificationsDatabase.length, ...(Array.isArray(parsed.notificationsDatabase) ? parsed.notificationsDatabase : []));
-
-        if (repairedBarcodeMap.size > 0) {
-          productionHistoryDatabase.forEach((h) => {
-            if (h.serialNumber && repairedBarcodeMap.has(h.serialNumber)) {
-              h.barcode = repairedBarcodeMap.get(h.serialNumber)!;
-              if (h.remarks && /WIDTHHEIGHT/i.test(h.remarks)) {
-                h.remarks = h.remarks.replace(/WIDTHHEIGHT/gi, h.barcode);
-              }
-            }
-          });
-          rejectDatabase.forEach((r) => {
-            if (r.serialNumber && repairedBarcodeMap.has(r.serialNumber)) {
-              r.barcode = repairedBarcodeMap.get(r.serialNumber)!;
-            }
-          });
-          reworkDatabase.forEach((rw) => {
-            if (rw.serialNumber && repairedBarcodeMap.has(rw.serialNumber)) {
-              rw.barcode = repairedBarcodeMap.get(rw.serialNumber)!;
-            }
-          });
-          dataChanged = true;
-        }
-
-        // Auto-sync: Ensure all rejected glass items automatically exist in reworkDatabase with remake tickets to Cutting
-        let autoSyncReworkAdded = false;
-        rejectDatabase.forEach((rej) => {
-          const alreadyInRework = reworkDatabase.some((rw) => rw.serialNumber === rej.serialNumber);
-          if (!alreadyInRework && rej.serialNumber) {
-            reworkDatabase.push({
-              id: `rew-${rej.id || Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-              serialNumber: rej.serialNumber,
-              barcode: rej.barcode,
-              piNumber: rej.piNumber,
-              fromStage: rej.stage || "Cutting",
-              targetStage: "Cutting",
-              reason: `[Auto-Remake after Rejection] ${rej.reason}`,
-              defectivePane: rej.defectivePane,
-              defectiveSerialNumber: rej.defectiveSerialNumber,
-              partnerSerialNumber: rej.partnerSerialNumber,
-              date: rej.date || new Date().toISOString(),
-              operator: rej.operator || "Operator",
-            });
-            autoSyncReworkAdded = true;
-
-            const item = glassItemsDatabase.find((g) => g.serialNumber === rej.serialNumber);
-            if (item && item.status !== "Completed") {
-              item.status = "Reworking";
-              item.currentStage = "Cutting";
-            }
-          }
-        });
-
-        if (autoSyncReworkAdded) {
-          saveDatabaseToDisk();
-        }
-
-        // If no persisted notifications yet, seed from real historical production actions
-        if (notificationsDatabase.length === 0) {
-          productionHistoryDatabase.slice(0, 15).forEach((h, idx) => {
-            const rawDate = h.timestamp ? new Date(h.timestamp).getTime() : Date.now() - idx * 1000;
-            const isReject = h.action?.toLowerCase().includes("reject") || h.status === "Rejected";
-            const isRework = h.action?.toLowerCase().includes("rework") || h.status === "Reworking";
-            const isUpload = h.action?.toLowerCase().includes("upload") || h.action?.toLowerCase().includes("batch");
-
-            let type: "info" | "success" | "warning" | "destructive" = "success";
-            let category: any = "STAGE_ADVANCE";
-            if (isReject) { type = "destructive"; category = "REJECTION"; }
-            else if (isRework) { type = "warning"; category = "REWORK"; }
-            else if (isUpload) { type = "info"; category = "BATCH_UPLOAD"; }
-
-            notificationsDatabase.push({
-              id: `notif-${h.id || idx}-${rawDate}`,
-              title: h.action || `${h.stage} Stage Advanced`,
-              message: h.remarks || `Item ${h.serialNumber} processed at ${h.stage} by ${h.operator || "Operator"}.`,
-              category,
-              type,
-              stage: String(h.stage || ""),
-              serialNumber: h.serialNumber,
-              operator: h.operator,
-              timestamp: h.timestamp || new Date(rawDate).toISOString(),
-              rawDate,
-              read: false,
-              createdAt: h.timestamp || new Date(rawDate).toISOString(),
-            });
-          });
-        }
-      } else {
-        piDatabase.length = 0;
-        glassItemsDatabase.length = 0;
-        productionHistoryDatabase.length = 0;
-        rejectDatabase.length = 0;
-        reworkDatabase.length = 0;
-        notificationsDatabase.length = 0;
-      }
-    } else {
-      piDatabase.length = 0;
-      glassItemsDatabase.length = 0;
-      productionHistoryDatabase.length = 0;
-      rejectDatabase.length = 0;
-      reworkDatabase.length = 0;
-      notificationsDatabase.length = 0;
-    }
-    isDbLoaded = true;
-  } catch (err: any) {
-    logger.error("Failed to load database from disk", { error: err?.message || String(err) });
+  for (const item of glassItemsDatabase) {
+    pushToMap(byPiId, item.piId, item);
+    pushToMap(byPiNum, item.piNumber, item);
+    pushToMap(byBatchNo, item.batchNo, item);
+    pushToMap(bySfoNo, item.sfoNo, item);
   }
+
+  return (pi: PIMaster) => {
+    const cleanId = (pi.id || "").replace(/^STK-/i, "");
+    const cleanPiNo = (pi.piNumber || "").replace(/^STK-/i, "");
+    const seen = new Set<string>();
+    const result: GlassItem[] = [];
+
+    const addAll = (list?: GlassItem[]) => {
+      if (!list) return;
+      for (const item of list) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          result.push(item);
+        }
+      }
+    };
+
+    addAll(byPiId.get(pi.id));
+    if (cleanId) addAll(byPiId.get(cleanId));
+    addAll(byPiNum.get(pi.piNumber));
+    if (cleanPiNo) addAll(byPiNum.get(cleanPiNo));
+    if (cleanPiNo) addAll(byBatchNo.get(cleanPiNo));
+    addAll(byBatchNo.get(pi.piNumber));
+    addAll(bySfoNo.get(pi.piNumber));
+    if (cleanPiNo) addAll(bySfoNo.get(cleanPiNo));
+
+    return result;
+  };
 }
 
-export function saveDatabaseToDisk(immediate = false): void {
-  if (process.env.NODE_ENV === "test" || process.env.VITEST) return;
-  const executeSave = () => {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
+function normalizeLoadedProductionData(): boolean {
+  let dataChanged = false;
+  // Ensure laminated glass items include Pairing in their processRoute before Lamination
+  glassItemsDatabase.forEach((item) => {
+    if (!Array.isArray(item.processRoute)) return;
+    const descLower = `${item.glassType || ""} ${item.glassCode || ""}`.toLowerCase();
+    const isLaminated = item.processRoute.includes("Lamination") || descLower.includes("lam") || descLower.includes("pvb") || descLower.includes("sgp");
+    if (isLaminated && !item.processRoute.includes("Pairing")) {
+      const lamIdx = item.processRoute.indexOf("Lamination");
+      if (lamIdx >= 0) {
+        item.processRoute.splice(lamIdx, 0, "Pairing");
+      } else {
+        item.processRoute.unshift("Pairing");
       }
-      const data: PersistedData = {
-        piDatabase,
-        glassItemsDatabase,
-        productionHistoryDatabase,
-        rejectDatabase,
-        reworkDatabase,
-        notificationsDatabase,
-      };
-      // Non-blocking async file write with compact JSON
-      fs.writeFile(DATA_FILE, JSON.stringify(data), "utf-8", (err) => {
-        if (err) {
-          logger.error("Failed to save database to disk asynchronously", { error: err.message });
-        }
+      if (item.currentStage === "Lamination" && !item.completedStages?.includes("Pairing")) {
+        item.currentStage = "Pairing";
+      }
+    }
+  });
+
+  // Auto-heal unpaired DGU/Lamination items that jumped to DGU or Finished without a partner pane
+  const advancedPairingCandidates = glassItemsDatabase.filter(
+    (other) => other.status !== "Rejected" && (other.currentStage === "DGU" || other.currentStage === "Finished" || other.status === "Completed")
+  );
+  glassItemsDatabase.forEach((item) => {
+    if (!Array.isArray(item.processRoute) || !item.processRoute.includes("Pairing")) return;
+    if (item.currentStage === "Cutting") return;
+
+    if (item.currentStage === "DGU" || item.currentStage === "Finished" || item.status === "Completed") {
+      const isDgu = item.glassCategory === "DGU" || item.processRoute.includes("DGU");
+      const isCol = item.colorOrClear === "Colour" || String(item.category || "").toLowerCase().includes("colour");
+
+      const hasPartner = advancedPairingCandidates.some((other) => {
+        if (other.id === item.id) return false;
+        if ((item as any).dguPairId && (other as any).dguPairId === (item as any).dguPairId) return true;
+        const isOtherCol = other.colorOrClear === "Colour" || String(other.category || "").toLowerCase().includes("colour");
+        if (isDgu && isOtherCol === isCol) return false;
+        if (other.posNo && item.posNo && String(other.posNo).trim() !== String(item.posNo).trim()) return false;
+        if (Math.abs((other.width || 0) - (item.width || 0)) >= 2) return false;
+        if (Math.abs((other.height || 0) - (item.height || 0)) >= 2) return false;
+        return true;
       });
 
-      // Also persist to MongoDB Atlas in background
-      saveProductionToMongo(data).catch((err) => {
-        logger.error("[MongoDB] Failed to async save to MongoDB Atlas", { error: err?.message || String(err) });
-      });
-    } catch (err: any) {
-      logger.error("Failed to save database to disk", { error: err?.message || String(err) });
+      if (!hasPartner) {
+        logger.warn(`[Auto-Heal] Resetting unpaired glass pane ${item.serialNumber} (${item.barcode}) from ${item.currentStage} back to Pairing Buffer.`);
+        item.currentStage = "Pairing";
+        item.status = "Pending";
+        item.completedStages = ["Cutting"];
+        delete (item as any).isDguReduced;
+        delete (item as any).dguPairId;
+        delete (item as any).lamPairId;
+        dataChanged = true;
+      }
     }
+  });
+
+  const colourRegex = COLOURED_COATED_GLASS_REGEX;
+
+  // Auto-heal invalid barcodes (e.g. "WIDTHHEIGHT" or non-digit header artifacts)
+  const repairedBarcodeMap = new Map<string, string>();
+  glassItemsDatabase.forEach((item, idx) => {
+    const b = String(item.barcode || "").trim();
+    if (!b || /width|height|order|customer|project|batch|glass/i.test(b) || /^[A-Z]+$/i.test(b) || !/\d/.test(b)) {
+      const cleanSfo = String(item.sfoNo || item.piNumber || "1344").replace(/[^0-9]/g, "");
+      const numPart = item.serialNumber ? String(item.serialNumber).replace(/\D/g, "") : "";
+      const seqPad = (numPart || String(idx + 1)).padStart(4, "0").slice(-4);
+      const fixedBarcode = formatGenericBarcode(cleanSfo, seqPad, BARCODE_PREFIX);
+      item.barcode = fixedBarcode;
+      item.qrId = `QR-${fixedBarcode}`;
+      if (item.serialNumber) {
+        repairedBarcodeMap.set(item.serialNumber, fixedBarcode);
+      }
+      dataChanged = true;
+    }
+  });
+
+  const getPiItems = buildPiItemsLookup();
+
+  piDatabase.forEach((pi) => {
+    const batchItems = glassItemsDatabase.filter(
+      (item) => item.piId === pi.id || (item.piNumber && item.piNumber === pi.piNumber)
+    );
+
+    const batchFullText = (
+      (pi.fileName || "") + " " +
+      (pi.glassDescription || "") + " " +
+      ((pi as any).remarks || "") + " " +
+      batchItems.map((i) => `${i.glassType || ""} ${i.glassCode || ""} ${i.category || ""} ${i.glassColor || ""} ${i.remarks || ""}`).join(" ")
+    ).toLowerCase();
+
+    const hasBatchColourKeyword = colourRegex.test(batchFullText);
+    const hasBatchClearKeyword = /clear/i.test(batchFullText);
+
+    let batchFinish: "Colour" | "Clear" = "Clear";
+    if (hasBatchColourKeyword) {
+      batchFinish = "Colour";
+    } else if (pi.colorOrClear === "Colour" || (pi.colorOrClear as any) === "Color" || pi.finish === "Colour") {
+      batchFinish = "Colour";
+    } else if (pi.colorOrClear === "Clear" || pi.finish === "Clear") {
+      batchFinish = "Clear";
+    } else if (hasBatchClearKeyword) {
+      batchFinish = "Clear";
+    } else {
+      const clearCount = batchItems.filter((item) => item.colorOrClear === "Clear" || /clear/i.test(item.glassColor || "")).length;
+      const colourCount = batchItems.filter((item) => item.colorOrClear === "Colour" || (item.colorOrClear as any) === "Color" || (colourRegex.test(item.glassColor || "") && !/clear/i.test(item.glassColor || ""))).length;
+      batchFinish = colourCount > clearCount ? "Colour" : "Clear";
+    }
+
+    if (pi.colorOrClear !== batchFinish || pi.finish !== batchFinish) {
+      pi.colorOrClear = batchFinish;
+      pi.finish = batchFinish;
+      dataChanged = true;
+    }
+
+    batchItems.forEach((item) => {
+      if (item.colorOrClear !== batchFinish || item.finish !== batchFinish) {
+        item.colorOrClear = batchFinish;
+        item.finish = batchFinish;
+        dataChanged = true;
+      }
+      if (batchFinish === "Colour" && (!item.glassColor || item.glassColor === "Clear Glass" || item.glassColor === "Clear Float")) {
+        item.glassColor = pi.glassColor || "Coloured Glass";
+        dataChanged = true;
+      } else if (batchFinish === "Clear" && (!item.glassColor || item.glassColor === "Coloured Glass")) {
+        item.glassColor = "Clear Glass";
+        dataChanged = true;
+      }
+    });
+
+    const distinctOrder = batchItems.find(
+      (i) => i.orderNo && i.orderNo !== pi.batchNo && i.orderNo !== pi.piNumber
+    )?.orderNo;
+    if (distinctOrder && (!pi.proformaInvNo || pi.proformaInvNo === pi.piNumber || pi.proformaInvNo === pi.batchNo)) {
+      pi.proformaInvNo = distinctOrder;
+      dataChanged = true;
+    }
+
+    const batchText = (
+      (pi.fileName || "") + " " +
+      (pi.glassDescription || "") + " " +
+      ((pi as any).remarks || "") + " " +
+      batchItems.map((i) => `${i.glassType || ""} ${i.glassCode || ""} ${i.category || ""} ${i.remarks || ""} ${i.makeup || ""}`).join(" ")
+    ).toLowerCase();
+
+    const isKnownLamBatch =
+      pi.piNumber === "5301" ||
+      pi.piNumber === "1620" ||
+      (pi as any).batchNo === "5301" ||
+      (pi as any).batchNo === "1620" ||
+      (pi.fileName || "").toLowerCase().includes("10 mm clear") ||
+      (pi.fileName || "").toLowerCase().includes("12 mm clear");
+    const hasInterlayer = isKnownLamBatch || /\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(batchText);
+    const hasSpacer = !isKnownLamBatch && /spacer|dgu|igu/i.test(batchText);
+
+    let batchCat: "DGU" | "Lamination" | "DLGU" = pi.glassCategory === "DLGU" ? "DLGU" : (pi.glassCategory === "Lamination" ? "Lamination" : "DGU");
+    if (pi.glassCategory === "DLGU" || (hasInterlayer && hasSpacer)) {
+      batchCat = "DLGU";
+    } else if (hasInterlayer && !hasSpacer) {
+      batchCat = "Lamination";
+    } else if (hasSpacer) {
+      batchCat = "DGU";
+    }
+
+    if (pi.glassCategory !== batchCat) {
+      pi.glassCategory = batchCat;
+      dataChanged = true;
+    }
+
+    batchItems.forEach((item) => {
+      const itemText = `${item.glassType || ""} ${item.glassCode || ""} ${item.remarks || ""} ${item.makeup || ""} ${(item as any).stickerRoute || ""}`.toLowerCase();
+      const isItemDlgu = item.glassCategory === "DLGU" || batchCat === "DLGU" || (/spacer|dgu|igu/i.test(itemText) && /\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText));
+      const isItemLam = !isItemDlgu && (item.glassCategory === "Lamination" || (/\b(pvb|sgp|eva|lamination|laminated|lami|lam)\b/i.test(itemText) && !/spacer|dgu|igu/i.test(itemText)));
+      const isItemDgu = !isItemDlgu && (item.glassCategory === "DGU" || /spacer|dgu|igu/i.test(itemText));
+      const resolvedCat: "DGU" | "Lamination" | "DLGU" = isItemDlgu ? "DLGU" : (isItemLam && !isItemDgu ? "Lamination" : (isItemDgu ? "DGU" : batchCat));
+
+      if (item.glassCategory !== resolvedCat) {
+        item.glassCategory = resolvedCat;
+        dataChanged = true;
+      }
+
+      const hasPolish = (item as any).hasPolish === true || /\bpolish\b/i.test(itemText) || /\bpolished\b/i.test(itemText) || (item.currentStage === "Polishing");
+
+      let expectedRoute: ProductionStage[];
+      if (resolvedCat === "DLGU") {
+        const isLamPane = item.colorOrClear === "Clear" || /lam|laminated|6mm clear/i.test(itemText);
+        expectedRoute = isLamPane
+          ? (hasPolish
+            ? ["Cutting", "Polishing", "Pairing", "Lamination", "Pairing", "DGU", "Finished"]
+            : ["Cutting", "Pairing", "Lamination", "Pairing", "DGU", "Finished"])
+          : (hasPolish
+            ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
+            : ["Cutting", "Pairing", "DGU", "Finished"]);
+        if (!item.dlguPhase) {
+          item.dlguPhase = isLamPane ? "LamPairing" : "DguPairing";
+          dataChanged = true;
+        }
+      } else if (resolvedCat === "Lamination") {
+        expectedRoute = hasPolish
+          ? ["Cutting", "Polishing", "Pairing", "Lamination", "Finished"]
+          : ["Cutting", "Pairing", "Lamination", "Finished"];
+        if (item.dlguPhase) {
+          delete item.dlguPhase;
+          dataChanged = true;
+        }
+      } else if (resolvedCat === "DGU") {
+        expectedRoute = hasPolish
+          ? ["Cutting", "Polishing", "Pairing", "DGU", "Finished"]
+          : ["Cutting", "Pairing", "DGU", "Finished"];
+        if (item.dlguPhase) {
+          delete item.dlguPhase;
+          dataChanged = true;
+        }
+      } else {
+        expectedRoute = hasPolish
+          ? ["Cutting", "Polishing", "Finished"]
+          : ["Cutting", "Finished"];
+        if (item.dlguPhase) {
+          delete item.dlguPhase;
+          dataChanged = true;
+        }
+      }
+
+      const isAdvancedNonPolish = item.currentStage && item.currentStage !== "Cutting" && item.currentStage !== "Polishing";
+      if (!isAdvancedNonPolish && JSON.stringify(item.processRoute) !== JSON.stringify(expectedRoute)) {
+        item.processRoute = expectedRoute;
+        dataChanged = true;
+      }
+    });
+  });
+
+  // Synchronize paired DGU / DLGU partner panes that were assembled and finished together
+  const finishedItems = glassItemsDatabase.filter((i) => i.currentStage === "Finished" && i.status !== "Rejected");
+  const dguStageItems = glassItemsDatabase.filter((i) => i.currentStage === "DGU");
+  finishedItems.forEach((fin) => {
+    if (fin.glassCategory === "DLGU" || fin.glassCategory === "DGU") {
+      const finPairId = (fin as any).lamPairId;
+      dguStageItems.forEach((other) => {
+        if (other.id !== fin.id && other.currentStage === "DGU") {
+          const samePair = (finPairId && (other as any).lamPairId === finPairId) ||
+            (other.posNo === fin.posNo && other.width === fin.width && other.height === fin.height && (other.piId === fin.piId || other.piNumber === fin.piNumber || other.orderNo === fin.orderNo));
+          if (samePair) {
+            other.currentStage = "Finished";
+            other.status = "Completed";
+            if (!other.completedStages.includes("DGU")) other.completedStages.push("DGU");
+            other.updatedAt = new Date().toISOString();
+            dataChanged = true;
+          }
+        }
+      });
+    }
+  });
+
+  // Update completed counts on PI masters
+  piDatabase.forEach((pi) => {
+    const piItems = getPiItems(pi);
+    if (piItems.length > 0) {
+      const comp = piItems.filter(isItemCompleted).length;
+      if (pi.completedItemsCount !== comp) {
+        pi.completedItemsCount = comp;
+        dataChanged = true;
+      }
+      if (comp >= piItems.length && comp > 0 && pi.status !== "Completed") {
+        pi.status = "Completed";
+        dataChanged = true;
+      } else if (comp < piItems.length && pi.status === "Completed") {
+        pi.status = "In Production";
+        dataChanged = true;
+      }
+    }
+  });
+
+  if (repairedBarcodeMap.size > 0) {
+    productionHistoryDatabase.forEach((h) => {
+      if (h.serialNumber && repairedBarcodeMap.has(h.serialNumber)) {
+        h.barcode = repairedBarcodeMap.get(h.serialNumber)!;
+        if (h.remarks && /WIDTHHEIGHT/i.test(h.remarks)) {
+          h.remarks = h.remarks.replace(/WIDTHHEIGHT/gi, h.barcode);
+        }
+      }
+    });
+    rejectDatabase.forEach((r) => {
+      if (r.serialNumber && repairedBarcodeMap.has(r.serialNumber)) {
+        r.barcode = repairedBarcodeMap.get(r.serialNumber)!;
+      }
+    });
+    reworkDatabase.forEach((rw) => {
+      if (rw.serialNumber && repairedBarcodeMap.has(rw.serialNumber)) {
+        rw.barcode = repairedBarcodeMap.get(rw.serialNumber)!;
+      }
+    });
+    dataChanged = true;
+  }
+
+  // Auto-sync: Ensure all rejected glass items automatically exist in reworkDatabase with remake tickets to Cutting
+  const existingReworkSerials = new Set(reworkDatabase.map((rw) => rw.serialNumber));
+  const itemBySerial = new Map<string, GlassItem>();
+  for (const g of glassItemsDatabase) {
+    if (g.serialNumber) itemBySerial.set(g.serialNumber, g);
+  }
+
+  rejectDatabase.forEach((rej) => {
+    if (rej.serialNumber && !existingReworkSerials.has(rej.serialNumber)) {
+      existingReworkSerials.add(rej.serialNumber);
+      reworkDatabase.push({
+        id: `rew-${rej.id || Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        serialNumber: rej.serialNumber,
+        barcode: rej.barcode,
+        piNumber: rej.piNumber,
+        fromStage: rej.stage || "Cutting",
+        targetStage: "Cutting",
+        reason: `[Auto-Remake after Rejection] ${rej.reason}`,
+        defectivePane: rej.defectivePane,
+        defectiveSerialNumber: rej.defectiveSerialNumber,
+        partnerSerialNumber: rej.partnerSerialNumber,
+        date: rej.date || new Date().toISOString(),
+        operator: rej.operator || "Operator",
+      });
+      dataChanged = true;
+
+      const item = itemBySerial.get(rej.serialNumber);
+      if (item && item.status !== "Completed") {
+        item.status = "Reworking";
+        item.currentStage = "Cutting";
+      }
+    }
+  });
+
+  // If no persisted notifications yet, seed from real historical production actions
+  if (notificationsDatabase.length === 0 && productionHistoryDatabase.length > 0) {
+    productionHistoryDatabase.slice(0, 15).forEach((h, idx) => {
+      const rawDate = h.timestamp ? new Date(h.timestamp).getTime() : Date.now() - idx * 1000;
+      const isReject = h.action?.toLowerCase().includes("reject") || h.status === "Rejected";
+      const isRework = h.action?.toLowerCase().includes("rework") || h.status === "Reworking";
+      const isUpload = h.action?.toLowerCase().includes("upload") || h.action?.toLowerCase().includes("batch");
+
+      let type: "info" | "success" | "warning" | "destructive" = "success";
+      let category: any = "STAGE_ADVANCE";
+      if (isReject) { type = "destructive"; category = "REJECTION"; }
+      else if (isRework) { type = "warning"; category = "REWORK"; }
+      else if (isUpload) { type = "info"; category = "BATCH_UPLOAD"; }
+
+      notificationsDatabase.push({
+        id: `notif-${h.id || idx}-${rawDate}`,
+        title: h.action || `${h.stage} Stage Advanced`,
+        message: h.remarks || `Item ${h.serialNumber} processed at ${h.stage} by ${h.operator || "Operator"}.`,
+        category,
+        type,
+        stage: String(h.stage || ""),
+        serialNumber: h.serialNumber,
+        operator: h.operator,
+        timestamp: h.timestamp || new Date(rawDate).toISOString(),
+        rawDate,
+        read: false,
+        createdAt: h.timestamp || new Date(rawDate).toISOString(),
+      });
+    });
+    dataChanged = true;
+  }
+
+  return dataChanged;
+}
+
+export async function initProductionDatabase(force = false): Promise<void> {
+  if (isDbLoaded && !force) return;
+  if (initDbPromise && !force) return initDbPromise;
+
+  initDbPromise = (async () => {
+    try {
+      const pgData = await loadProductionFromPostgres();
+      if (!pgData) {
+        initDbPromise = null;
+        return;
+      }
+
+      piDatabase.splice(0, piDatabase.length, ...pgData.piDatabase);
+      glassItemsDatabase.splice(0, glassItemsDatabase.length, ...pgData.glassItemsDatabase);
+      productionHistoryDatabase.splice(0, productionHistoryDatabase.length, ...pgData.productionHistoryDatabase);
+      rejectDatabase.splice(0, rejectDatabase.length, ...pgData.rejectDatabase);
+      reworkDatabase.splice(0, reworkDatabase.length, ...pgData.reworkDatabase);
+      notificationsDatabase.splice(0, notificationsDatabase.length, ...pgData.notificationsDatabase);
+
+      const changed = normalizeLoadedProductionData();
+      if (changed) {
+        saveDatabase(true);
+      }
+      logger.info(`[PostgreSQL] Loaded ${piDatabase.length} batches and ${glassItemsDatabase.length} items from local PostgreSQL.`);
+      isDbLoaded = true;
+    } catch (err: any) {
+      initDbPromise = null;
+      logger.error("[PostgreSQL] Failed to initialize production database", { error: err?.message || String(err) });
+    }
+  })();
+
+  await initDbPromise;
+}
+
+export function saveDatabase(immediate = false): void {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST) return;
+  const executeSave = () => {
+    const data: PersistedData = {
+      piDatabase,
+      glassItemsDatabase,
+      productionHistoryDatabase,
+      rejectDatabase,
+      reworkDatabase,
+      notificationsDatabase,
+    };
+    saveProductionToPostgres(data).catch((err) => {
+      logger.error("[PostgreSQL] Failed to async save production state", { error: err?.message || String(err) });
+    });
   };
 
   if (immediate) {
@@ -586,57 +523,7 @@ export function saveDatabaseToDisk(immediate = false): void {
     executeSave();
   } else {
     if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
-    saveDebounceTimer = setTimeout(executeSave, 100);
-  }
-}
-
-/**
- * Synchronize in-memory database with MongoDB Atlas.
- * If MongoDB has data, load it and update local cache.
- * If MongoDB is empty, seed it from local database.
- */
-export async function syncDatabaseWithMongo(): Promise<void> {
-  try {
-    const mongoData = await loadProductionFromMongo();
-    if (mongoData && Array.isArray(mongoData.piDatabase) && mongoData.piDatabase.length > 0) {
-      piDatabase.splice(0, piDatabase.length, ...mongoData.piDatabase);
-      glassItemsDatabase.splice(0, glassItemsDatabase.length, ...(Array.isArray(mongoData.glassItemsDatabase) ? mongoData.glassItemsDatabase : []));
-      productionHistoryDatabase.splice(0, productionHistoryDatabase.length, ...(Array.isArray(mongoData.productionHistoryDatabase) ? mongoData.productionHistoryDatabase : []));
-      rejectDatabase.splice(0, rejectDatabase.length, ...(Array.isArray(mongoData.rejectDatabase) ? mongoData.rejectDatabase : []));
-      reworkDatabase.splice(0, reworkDatabase.length, ...(Array.isArray(mongoData.reworkDatabase) ? mongoData.reworkDatabase : []));
-      notificationsDatabase.splice(0, notificationsDatabase.length, ...(Array.isArray(mongoData.notificationsDatabase) ? mongoData.notificationsDatabase : []));
-
-      // Save local backup snapshot to disk
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      fs.writeFileSync(DATA_FILE, JSON.stringify({
-        piDatabase,
-        glassItemsDatabase,
-        productionHistoryDatabase,
-        rejectDatabase,
-        reworkDatabase,
-        notificationsDatabase,
-      }), "utf-8");
-
-      broadcastUpdate();
-      logger.info(`[MongoDB] Successfully loaded ${piDatabase.length} batches and ${glassItemsDatabase.length} items from MongoDB Atlas.`);
-    } else if (piDatabase.length > 0) {
-      // Seed MongoDB with current local database
-      const saved = await saveProductionToMongo({
-        piDatabase,
-        glassItemsDatabase,
-        productionHistoryDatabase,
-        rejectDatabase,
-        reworkDatabase,
-        notificationsDatabase,
-      });
-      if (saved) {
-        logger.info(`[MongoDB] Seeded MongoDB Atlas with current ${piDatabase.length} batches and ${glassItemsDatabase.length} items.`);
-      }
-    }
-  } catch (err: any) {
-    logger.error("[MongoDB] Error syncing database with MongoDB", { error: err?.message || String(err) });
+    saveDebounceTimer = setTimeout(executeSave, 150);
   }
 }
 
@@ -674,33 +561,23 @@ export function createAndBroadcastNotification(params: {
     notificationsDatabase.splice(100);
   }
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("system_notification", notif);
   return notif;
 }
 
-// Load persisted state on startup
-loadDatabaseFromDisk(true);
-
 export const handleGetPIs: RequestHandler = (req, res) => {
-  // Sync real-time completion status for all batches
+  // Sync real-time completion status for all batches in one O(N) pass
   let statusChanged = false;
+  const getPiItems = buildPiItemsLookup();
   piDatabase.forEach((pi) => {
-    const cleanId = (pi.id || "").replace(/^STK-/i, "");
-    const cleanPiNo = (pi.piNumber || "").replace(/^STK-/i, "");
-    const piItems = glassItemsDatabase.filter(
-      (i) =>
-        i.piId === pi.id ||
-        i.piNumber === pi.piNumber ||
-        i.piId === cleanId ||
-        i.piNumber === cleanPiNo ||
-        i.batchNo === cleanPiNo ||
-        i.batchNo === pi.piNumber ||
-        (i.sfoNo && (i.sfoNo === pi.piNumber || i.sfoNo === cleanPiNo))
-    );
+    const piItems = getPiItems(pi);
     if (piItems.length > 0) {
       const completedCount = piItems.filter(isItemCompleted).length;
-      pi.completedItemsCount = completedCount;
+      if (pi.completedItemsCount !== completedCount) {
+        pi.completedItemsCount = completedCount;
+        statusChanged = true;
+      }
       const newStatus = completedCount >= piItems.length && piItems.length > 0 ? "Completed" : (completedCount > 0 || piItems.some((i) => i.currentStage !== "Cutting" || i.completedStages?.length || isItemInPackingStage(i)) ? "In Production" : (pi.status || "Pending"));
       if (pi.status !== newStatus) {
         pi.status = newStatus;
@@ -710,7 +587,7 @@ export const handleGetPIs: RequestHandler = (req, res) => {
   });
 
   if (statusChanged) {
-    saveDatabaseToDisk();
+    saveDatabase();
   }
 
   const page = parseInt(req.query.page as string, 10);
@@ -819,7 +696,7 @@ export const handleDeletePI: RequestHandler = (req, res) => {
     }
   }
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("pi_deleted", { piId: deletedPI.id });
   const cleanBatchNo = (deletedPI.piNumber || "").replace(/^B(?=\d)/i, "");
   createAndBroadcastNotification({
@@ -854,7 +731,7 @@ export const handleReleasePI: RequestHandler = (req, res) => {
     }
   });
 
-  saveDatabaseToDisk();
+  saveDatabase();
   broadcastUpdate("pi_released", { piId: pi.id });
   createAndBroadcastNotification({
     title: `PI #${pi.piNumber} Released`,

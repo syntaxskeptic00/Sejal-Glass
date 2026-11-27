@@ -314,21 +314,50 @@ export const StickerUploaderModal: React.FC<StickerUploaderModalProps> = ({ open
         // Factory barcode stickers have a pure numeric barcode (typically 12-20 digits, starting with 10126 or 101) printed directly under the barcode bars.
         let detectedBarcode = "";
 
-        // Priority 1: Direct match in fullPageText for ERP standard barcode (using configured/known prefixes or generic)
-        let sejalCodeMatch: RegExpMatchArray | null = null;
+        // Priority 0: Match letter-spaced ERP barcode (e.g. "1 0 1 2 6 2 7 0 2 9 3 0 0 0 6 1")
         for (const pfx of KNOWN_BARCODE_PREFIXES) {
-          const reg = new RegExp(`\\b(${pfx}\\d{6,16})\\b`);
-          const m = fullPageText.match(reg);
-          if (m) {
-            sejalCodeMatch = m;
+          const spacedPfx = pfx.split("").join("\\s*");
+          const spacedReg = new RegExp(`\\b(${spacedPfx}(?:\\s*\\d){6,16})\\b`);
+          const sm = fullPageText.match(spacedReg);
+          if (sm) {
+            detectedBarcode = sm[1].replace(/\s+/g, "");
             break;
           }
         }
-        if (!sejalCodeMatch) {
-          sejalCodeMatch = fullPageText.match(/\b(10126\d{7,15})\b/) || fullPageText.match(/\b(101\d{9,17})\b/);
+        if (!detectedBarcode) {
+          const generalSpaced = fullPageText.match(/\b(?:1\s*0\s*1\s*2\s*6(?:\s*\d){7,15}|1\s*0\s*1(?:\s*\d){9,17})\b/);
+          if (generalSpaced) {
+            detectedBarcode = generalSpaced[0].replace(/\s+/g, "");
+          }
         }
-        if (sejalCodeMatch) {
-          detectedBarcode = sejalCodeMatch[1];
+        if (!detectedBarcode) {
+          // Look for any string of 12 to 20 digits separated by single spaces
+          const anySpacedDigits = fullPageText.match(/\b(?:\d\s+){11,21}\d\b/);
+          if (anySpacedDigits) {
+            const cleanD = anySpacedDigits[0].replace(/\s+/g, "");
+            if (cleanD.length >= 12 && cleanD.length <= 22 && !cleanD.includes("/")) {
+              detectedBarcode = cleanD;
+            }
+          }
+        }
+
+        // Priority 1: Direct match in fullPageText for ERP standard barcode (using configured/known prefixes or generic)
+        if (!detectedBarcode) {
+          let sejalCodeMatch: RegExpMatchArray | null = null;
+          for (const pfx of KNOWN_BARCODE_PREFIXES) {
+            const reg = new RegExp(`\\b(${pfx}\\d{6,16})\\b`);
+            const m = fullPageText.match(reg);
+            if (m) {
+              sejalCodeMatch = m;
+              break;
+            }
+          }
+          if (!sejalCodeMatch) {
+            sejalCodeMatch = fullPageText.match(/\b(10126\d{7,15})\b/) || fullPageText.match(/\b(101\d{9,17})\b/);
+          }
+          if (sejalCodeMatch) {
+            detectedBarcode = sejalCodeMatch[1];
+          }
         }
 
         // Priority 2: Look in textBlocks for a pure numeric block with 12 to 22 digits

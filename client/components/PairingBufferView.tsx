@@ -379,8 +379,10 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
         .filter((i: any) => i.currentStage?.toLowerCase() === "cutting")
         .reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
 
-      // Pieces currently waiting in buffer
-      const bufferPieces = g.bufferItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
+      // Pieces currently waiting in buffer (post-lamination DLGU Clear panes are 2-in-1 laminated units)
+      const rawBufferPieces = g.bufferItems.reduce((acc: number, curr: any) => acc + (curr.qty || 1), 0);
+      const isPostLamDlguClearRow = g.glassCategory === "DLGU" && g.finish === "Clear" && g.dlguPhase === "DguPairing";
+      const bufferPieces = isPostLamDlguClearRow ? Math.ceil(rawBufferPieces / 2) : rawBufferPieces;
 
       // Pieces assembled and dispatched to Finished
       const finishedPieces = g.rawItems
@@ -449,11 +451,17 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
       if (partner) {
         row.matchingPartnerRow = partner;
         // Ready pairs is the minimum of cut pieces in buffer / available in lamination for both sides
+        // Post-lamination DLGU Clear rows (dlguPhase === "DguPairing") already store inBufferQty as laminated units.
         const partnerAvailable =
           row.glassCategory === "DLGU" && row.finish === "Colour"
-            ? (partner.dlguPhase === "DguPairing" ? Math.floor(partner.inBufferQty / 2) : Math.ceil(partner.rawItems.filter((i: any) => i.currentStage === "Lamination" || (i.currentStage === "Pairing" && i.completedStages?.includes("Lamination"))).reduce((a: number, b: any) => a + (b.qty || 1), 0) / 2))
-            : (row.glassCategory === "DLGU" && row.finish === "Clear" ? partner.inBufferQty : partner.inBufferQty);
-        const myAvailable = row.glassCategory === "DLGU" && row.finish === "Clear" ? Math.floor(row.inBufferQty / 2) : row.inBufferQty;
+            ? (partner.dlguPhase === "DguPairing"
+                ? partner.inBufferQty
+                : Math.ceil(partner.rawItems.filter((i: any) => i.currentStage === "Lamination" || (i.currentStage === "Pairing" && i.completedStages?.includes("Lamination"))).reduce((a: number, b: any) => a + (b.qty || 1), 0) / 2))
+            : partner.inBufferQty;
+        const myAvailable =
+          row.glassCategory === "DLGU" && row.finish === "Clear" && row.dlguPhase === "LamPairing"
+            ? Math.floor(row.inBufferQty / 2)
+            : row.inBufferQty;
         row.readyPairsCount = Math.min(myAvailable, partnerAvailable);
         row.waitingFinish = partner.finish !== row.finish
           ? partner.finish
@@ -897,9 +905,15 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
         if (processedPairs.has(pairKey)) return;
         processedPairs.add(pairKey);
 
-        // Collect matching items in buffer up to ready count
-        const colSerials = row.bufferItems.slice(0, row.readyPairsCount).map((i) => i.serialNumber);
-        const clrSerials = row.matchingPartnerRow.bufferItems.slice(0, row.readyPairsCount).map((i) => i.serialNumber);
+        // Collect matching items in buffer up to ready count (2 raw panes per post-lamination DLGU Clear unit)
+        const isPostLamClear = (r: ConsolidatedPositionRow) =>
+          r.glassCategory === "DLGU" && r.finish === "Clear" && r.dlguPhase === "DguPairing";
+        const colSerials = row.bufferItems
+          .slice(0, isPostLamClear(row) ? row.readyPairsCount * 2 : row.readyPairsCount)
+          .map((i) => i.serialNumber);
+        const clrSerials = row.matchingPartnerRow.bufferItems
+          .slice(0, isPostLamClear(row.matchingPartnerRow) ? row.readyPairsCount * 2 : row.readyPairsCount)
+          .map((i) => i.serialNumber);
         serialsToAdvance.push(...colSerials, ...clrSerials);
       }
     });
@@ -1048,7 +1062,7 @@ export const PairingBufferView: React.FC<PairingBufferViewProps> = ({
   useBarcodeScanner({
     enabled: Boolean(scanRow),
     priority: 10,
-    duplicateCooldownMs: 1800,
+    duplicateCooldownMs: 400,
     onScan: (scanned) => {
       if (isScanVerifyingRef.current) return;
       isScanVerifyingRef.current = true;

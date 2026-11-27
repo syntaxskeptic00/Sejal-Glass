@@ -108,12 +108,11 @@ function handleGlobalKeyDown(e: KeyboardEvent) {
 
       // Debounce hardware trigger repeat bursts on the same barcode
       const nowEpoch = Date.now();
-      const cooldown = scanner.duplicateCooldownMs ?? 1800;
+      const cooldown = scanner.duplicateCooldownMs ?? 400;
       if (
         globalLastScannedBarcode === candidate &&
         nowEpoch - globalLastScanEpoch < cooldown
       ) {
-        globalLastScanEpoch = nowEpoch;
         return;
       }
 
@@ -191,7 +190,7 @@ export function useBarcodeScanner({
   onScan,
   minLen = 3,
   maxIntervalMs = 70,
-  duplicateCooldownMs = 1800,
+  duplicateCooldownMs = 400,
   enabled = true,
   ignoreWhenInputFocused = true,
   validate,

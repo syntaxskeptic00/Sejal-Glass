@@ -2492,7 +2492,7 @@ export const ProductionStageView: React.FC<ProductionStageViewProps> = ({
   useBarcodeScanner({
     enabled: Boolean(scanRow),
     priority: 10,
-    duplicateCooldownMs: 1800,
+    duplicateCooldownMs: 400,
     onScan: (scanned) => {
       if (isVerifyingScanRef.current) return;
       isVerifyingScanRef.current = true;

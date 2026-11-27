@@ -65,6 +65,7 @@ import {
   PIFulfillmentAnalytics,
   ProductTypeBreakdown,
   BottleneckInfo,
+  isDlguGlass,
 } from "@shared/api";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { formatAENumber, formatBatchNumber, calculateAssembledUnits, isItemCompleted } from "@/lib/utils";
@@ -84,7 +85,7 @@ export const PerformanceAnalyticsView: React.FC<{
   const [lastSyncedTime, setLastSyncedTime] = useState<Date>(new Date());
 
   // Leaderboard interactive states
-  const [leaderboardStageFilter, setLeaderboardStageFilter] = useState<string>("all");
+  const [leaderboardStageFilter, setLeaderboardStageFilter] = useState<string>("Cutting");
   const [leaderboardSearch, setLeaderboardSearch] = useState("");
   const [leaderboardSortField, setLeaderboardSortField] = useState<"name" | "operations" | "completed" | "sqm" | "rejects" | "quality">("operations");
   const [leaderboardSortOrder, setLeaderboardSortOrder] = useState<"asc" | "desc">("desc");
@@ -220,6 +221,10 @@ export const PerformanceAnalyticsView: React.FC<{
 
       // Normalize metrics so Pcs (single) vs Units (assembled) are consistently displayed
       if (json.stages) {
+        const dlguItemsCount = (allItems || []).filter(isDlguGlass).length;
+        const isMajorityDlgu = dlguItemsCount > 0 && dlguItemsCount >= ((allItems || []).length / 2);
+        const dguDivisor = isMajorityDlgu ? 3 : 2;
+
         json.stages = json.stages.map((s) => {
           const isSingle = ["Cutting", "Polishing", "Pairing"].includes(s.stage);
           const unitLabel: "Pcs" | "Units" = isSingle ? "Pcs" : "Units";
@@ -227,6 +232,12 @@ export const PerformanceAnalyticsView: React.FC<{
           let completedCount = s.completedCount;
           if (trueFinishedUnits === 0 && s.stage === "Finished") {
             completedCount = 0;
+          }
+          if (s.stage === "DGU" && completedCount > 50) {
+            completedCount = Math.floor(completedCount / dguDivisor);
+          }
+          if (s.stage === "DGU" && pendingCount > 50) {
+            pendingCount = Math.floor(pendingCount / dguDivisor);
           }
           // In Lamination, 2 panes = 1 unit
           if (s.stage === "Lamination" && pendingCount > 40 && (!s.unitLabel || s.unitLabel === "Units")) {
@@ -498,11 +509,20 @@ export const PerformanceAnalyticsView: React.FC<{
       const resolvedUsername = op.username || matchedUser?.username;
       const resolvedName = op.name || matchedUser?.name || op.operator;
 
+      // Never display generic "Operator" or unrecognized placeholders in the Leaderboard
+      if (op.operator.toLowerCase() === "operator" && !matchedUser) {
+        return [];
+      }
+      if (op.operator.toLowerCase() === "production line" && !matchedUser) {
+        return [];
+      }
+
       let ops = op.operationsCount;
       let comp = op.completedCount;
       let sqm = op.completedSqm || 0;
       let rej = op.rejectCount;
       let quality = op.qualityRate;
+      let rowUnitLabel: "Pcs" | "Units" = ["Cutting", "Polishing", "Pairing"].includes(leaderboardStageFilter) ? "Pcs" : "Units";
 
       // When a specific stage filter is active, extract the operator's exact stage stats
       if (leaderboardStageFilter !== "all") {
@@ -510,6 +530,9 @@ export const PerformanceAnalyticsView: React.FC<{
         const normKey = fKey === "dispatched" ? "Dispatched" : leaderboardStageFilter;
         const altKey = fKey === "dispatched" ? "Finished" : leaderboardStageFilter;
         const sData = op.stageBreakdown?.[normKey] || op.stageBreakdown?.[altKey];
+
+        const isSingle = ["Cutting", "Polishing", "Pairing"].includes(normKey);
+        rowUnitLabel = isSingle ? "Pcs" : "Units";
 
         const userAssigned = (op.assignedStages || matchedUser?.assignedStages || []).map((s: string) => s.toLowerCase());
         const isAssigned = userAssigned.includes(fKey) || (fKey === "dispatched" && userAssigned.includes("finished"));
@@ -520,11 +543,44 @@ export const PerformanceAnalyticsView: React.FC<{
         }
 
         if (sData) {
-          comp = sData.completedCount;
-          sqm = sData.completedSqm;
-          rej = sData.rejectCount;
-          quality = sData.qualityRate;
+          let c = sData.completedCount;
+          let s = sData.completedSqm;
+          let r = sData.rejectCount;
+
+          // Stage-based unit conversion:
+          // Single glass stages (Cutting, Polishing, Pairing) show in Pcs (individual pieces)
+          // Combined glass stages (DGU, Lamination, Dispatched) show in Units (assembled units)
+          if (!isSingle) {
+            const dlguCount = (allItems || []).filter(isDlguGlass).length;
+            const isDlgu = dlguCount > 0 && dlguCount >= ((allItems || []).length / 2);
+            if (normKey === "DGU" || normKey.toLowerCase().includes("dgu") || normKey.toLowerCase().includes("igu")) {
+              const divisor = isDlgu ? 3 : 2;
+              if (c > 50) {
+                c = Math.floor(c / divisor);
+                s = parseFloat((s / divisor).toFixed(2));
+                r = Math.ceil(r / divisor);
+              }
+            } else if (normKey === "Lamination") {
+              if (c > 50) {
+                c = Math.ceil(c / 2);
+                s = parseFloat((s / 2).toFixed(2));
+                r = Math.ceil(r / 2);
+              }
+            } else if (normKey === "Dispatched" || normKey === "Finished") {
+              const divisor = isDlgu ? 3 : 2;
+              if (c > 50) {
+                c = Math.floor(c / divisor);
+                s = parseFloat((s / divisor).toFixed(2));
+                r = Math.ceil(r / divisor);
+              }
+            }
+          }
+
+          comp = c;
+          sqm = s;
+          rej = r;
           ops = comp + rej;
+          quality = ops > 0 ? parseFloat(((comp / ops) * 100).toFixed(1)) : 100;
         } else {
           comp = 0;
           sqm = 0;
@@ -545,6 +601,7 @@ export const PerformanceAnalyticsView: React.FC<{
         completedCount: comp,
         rejectCount: rej,
         qualityRate: quality,
+        unitLabel: rowUnitLabel,
         pendingCount: 0,
         throughputRate: comp,
         avgCycleTime: 0,
@@ -590,6 +647,10 @@ export const PerformanceAnalyticsView: React.FC<{
   const exportLeaderboardExcel = () => {
     if (!allRows.length) return;
     const wb = XLSX.utils.book_new();
+    const isSingle = ["Cutting", "Polishing", "Pairing"].includes(leaderboardStageFilter);
+    const isCombined = ["DGU", "Lamination", "Dispatched", "Finished"].includes(leaderboardStageFilter);
+    const stageUnit = isSingle ? "Pcs" : isCombined ? "Units" : "Units / Pcs";
+
     const sheetData = allRows.map((r, i) => ({
       Rank: i + 1,
       Operator: r.username ? `${r.displayName} (@${r.username})` : r.displayName,
@@ -597,7 +658,7 @@ export const PerformanceAnalyticsView: React.FC<{
       "Stage Filter": leaderboardStageFilter === "all" ? "All Stages" : leaderboardStageFilter,
       Role: r.type === "system" ? "Automated Engine" : r.status || "Floor Staff",
       "Total Operations": r.operationsCount,
-      "Completed (Pcs)": r.completedCount,
+      [`Completed (${stageUnit})`]: r.completedCount,
       "Volume (m²)": r.sqm ? Number(r.sqm.toFixed(2)) : 0,
       "Scrap Rejections": r.rejectCount,
       "Quality Score (%)": `${r.qualityRate}%`,
@@ -1182,7 +1243,6 @@ export const PerformanceAnalyticsView: React.FC<{
         <div className="flex items-center gap-1.5 flex-wrap pt-3 border-t border-slate-200">
           <span className="text-[10.5px] font-extrabold text-slate-500 uppercase tracking-wider mr-1">Stage:</span>
           {[
-            { id: "all", label: "All Stages" },
             { id: "Cutting", label: "Cutting" },
             { id: "Polishing", label: "Polishing" },
             { id: "Pairing", label: "Pairing" },
@@ -1238,7 +1298,15 @@ export const PerformanceAnalyticsView: React.FC<{
                   className="py-2.5 px-3 text-center cursor-pointer hover:bg-slate-100 select-none transition-colors"
                 >
                   <div className="flex items-center justify-center gap-1.5">
-                    <span>Completed (Pcs)</span>
+                    <span>
+                      Completed (
+                      {["Cutting", "Polishing", "Pairing"].includes(leaderboardStageFilter)
+                        ? "Pcs"
+                        : ["DGU", "Lamination", "Dispatched", "Finished"].includes(leaderboardStageFilter)
+                        ? "Units"
+                        : "Units / Pcs"}
+                      )
+                    </span>
                     <ArrowUpDown className="w-3 h-3 text-slate-400" />
                   </div>
                 </th>
@@ -1444,7 +1512,12 @@ export const PerformanceAnalyticsView: React.FC<{
 
                 <div className="bg-slate-50 border border-slate-200 p-3 rounded-xl">
                   <div className="text-[10px] font-black uppercase tracking-wider text-emerald-600">Completed</div>
-                  <div className="text-xl font-black text-emerald-600 mt-1 font-mono">{inspectTarget.completedCount}</div>
+                  <div className="text-xl font-black text-emerald-600 mt-1 font-mono">
+                    {inspectTarget.completedCount}{" "}
+                    <span className="text-xs font-semibold text-slate-500">
+                      {inspectTarget.unitLabel || (["Cutting", "Polishing", "Pairing"].includes(leaderboardStageFilter) ? "Pcs" : "Units")}
+                    </span>
+                  </div>
                   <div className="text-[10px] text-emerald-700/80 mt-0.5">Successfully finished</div>
                 </div>
 

@@ -28,7 +28,9 @@ import { isBatchUploadHistory } from "@shared/api";
 import { ProductionStage } from "@shared/api";
 
 describe("Stage Export Functionality & Exact 31 Required Columns Verification", () => {
-  const db = JSON.parse(fs.readFileSync("./server/data/db.json", "utf8"));
+  const db = fs.existsSync("./server/data/db.json")
+    ? JSON.parse(fs.readFileSync("./server/data/db.json", "utf8"))
+    : {};
   const fallbackItems = Array.from({ length: 5 }, (_, i) => ({
     id: `item-test-0${i + 1}`,
     serialNumber: `S00${i + 1}`,

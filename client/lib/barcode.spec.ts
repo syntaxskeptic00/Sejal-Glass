@@ -502,6 +502,101 @@ describe("Generic Sticker & A1.pdf Barcode Scanning Support", () => {
       expect(parseRackBarcode("1812627016610063").isRack).toBe(false);
     });
   });
+
+  describe("POS Collision & Cross-Batch Sticker Isolation", () => {
+    it("should not match another POS item whose SFO/POS digits happen to collide with a different full sticker barcode", () => {
+      const otherPosItem = {
+        id: "item-s059",
+        serialNumber: "S059",
+        barcode: "1012627029330008",
+        sfoNo: "2932",
+        posNo: "4",
+        srNo: 59,
+        currentStage: "Cutting",
+        processRoute: ["Cutting", "Pairing", "DGU", "Finished"],
+        completedStages: [],
+        status: "Pending",
+      };
+      const targetItem = {
+        id: "item-s549",
+        serialNumber: "S549",
+        barcode: "1012627029320004",
+        sfoNo: "60293",
+        posNo: "2",
+        srNo: 549,
+        currentStage: "Cutting",
+        processRoute: ["Cutting", "Pairing", "DGU", "Finished"],
+        completedStages: [],
+        status: "Pending",
+      };
+
+      expect(isItemMatchingCode(otherPosItem, "1012627029320004")).toBe(false);
+      const res = evaluateScanStatus([otherPosItem, targetItem], "1012627029320004", "Cutting");
+      expect(res.status).toBe("can_advance");
+      expect(res.item.serialNumber).toBe("S549");
+      expect(res.item.posNo).toBe("2");
+    });
+
+    it("should report already_scanned for POS #2 instead of falsely advancing a colliding POS #3 sticker", () => {
+      const completedPos2 = {
+        id: "item-pos2",
+        serialNumber: "S688",
+        barcode: "1012627029300003",
+        sfoNo: "50292",
+        posNo: "2",
+        srNo: 99,
+        currentStage: "Pairing",
+        processRoute: ["Cutting", "Pairing", "DGU", "Finished"],
+        completedStages: ["Cutting"],
+        status: "In Production",
+      };
+      const pendingPos3 = {
+        id: "item-pos3",
+        serialNumber: "S462",
+        barcode: "1012627029310068",
+        sfoNo: "2930",
+        posNo: "3",
+        srNo: 462,
+        currentStage: "Cutting",
+        processRoute: ["Cutting", "Pairing", "DGU", "Finished"],
+        completedStages: [],
+        status: "Pending",
+      };
+
+      const res = evaluateScanStatus([completedPos2, pendingPos3], "1012627029300003", "Cutting");
+      expect(res.status).toBe("already_scanned");
+      expect(res.item.posNo).toBe("2");
+      expect(res.message).toContain("POS #2");
+    });
+
+    it("should not let short numeric POS input match an unrelated item's S-prefixed serial number", () => {
+      const s004 = {
+        id: "item-s004",
+        serialNumber: "S004",
+        barcode: "1012627029300067",
+        posNo: "34",
+        currentStage: "Cutting",
+        processRoute: ["Cutting", "Finished"],
+        completedStages: [],
+        status: "Pending",
+      };
+      const pos4 = {
+        id: "item-pos4",
+        serialNumber: "S020",
+        barcode: "1012627029300007",
+        posNo: "4",
+        currentStage: "Cutting",
+        processRoute: ["Cutting", "Finished"],
+        completedStages: [],
+        status: "Pending",
+      };
+
+      const res = evaluateScanStatus([s004, pos4], "4", "Cutting");
+      expect(res.status).toBe("can_advance");
+      expect(res.item.posNo).toBe("4");
+      expect(res.item.serialNumber).toBe("S020");
+    });
+  });
 });
 
 

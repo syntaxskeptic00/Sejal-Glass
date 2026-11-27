@@ -251,6 +251,10 @@ import {
   KNOWN_BARCODE_PREFIXES,
   formatGenericBarcode,
   formatSejalBarcode,
+  cleanScannedBarcode,
+  isDirectIdentifierMatch,
+  isItemMatchingCode,
+  findMatchingItemsByCode,
 } from "@shared/api";
 
 export {
@@ -258,162 +262,11 @@ export {
   KNOWN_BARCODE_PREFIXES,
   formatGenericBarcode,
   formatSejalBarcode,
+  cleanScannedBarcode,
+  isDirectIdentifierMatch,
+  isItemMatchingCode,
+  findMatchingItemsByCode,
 };
-
-/**
- * Clean hardware barcode scanner gun input (strips AIM identifiers, QR/BAR prefixes, hashes, whitespace)
- */
-export function cleanScannedBarcode(rawCode: string): string {
-  if (!rawCode) return "";
-  return String(rawCode)
-    .trim()
-    .replace(/^\][a-zA-Z0-9]{2}/, "") // Strip AIM symbology prefix (e.g. ]C1 for Code 128, ]Q1 for QR)
-    .replace(/^QR[-_:]?/i, "")        // Strip QR- prefix
-    .replace(/^BAR[-_:]?/i, "")       // Strip BAR- prefix
-    .replace(/^#/, "")                // Strip leading #
-    .replace(/[\x00-\x1F\x7F]/g, "")  // Strip non-printable control characters (STX, ETX, CR, LF, etc.)
-    .trim();
-}
-
-/**
- * Checks if a glass item matches a scanned code across all possible barcode, QR, serial, POS, Order, and SFO formats
- */
-export function isItemMatchingCode(item: any, rawCode: string): boolean {
-  if (!item || !rawCode) return false;
-  const clean = cleanScannedBarcode(rawCode);
-  if (!clean) return false;
-
-  const cleanLower = clean.toLowerCase();
-  const digitsOnly = clean.replace(/\D/g, "");
-  const cleanNormalized = clean.replace(/[\s\-_/.]/g, "").toLowerCase();
-
-  // 1. Direct ID & Serial Number match
-  if (item.id && String(item.id).toLowerCase() === cleanLower) return true;
-  if (item.serialNumber) {
-    const s = String(item.serialNumber).toLowerCase();
-    if (s === cleanLower || s.replace(/^#/, "") === cleanLower) return true;
-    const sDigits = s.replace(/\D/g, "");
-    if (/^\d+$/.test(clean) && digitsOnly && sDigits && (sDigits === digitsOnly || sDigits.replace(/^0+/, "") === digitsOnly.replace(/^0+/, ""))) {
-      return true;
-    }
-  }
-
-  // 2. Direct Barcode & QR ID match
-  if (item.barcode) {
-    const b = String(item.barcode).toLowerCase();
-    if (b === cleanLower || b.replace(/^qr[-_:]?/i, "") === cleanLower) return true;
-    if (digitsOnly && b.replace(/\D/g, "") === digitsOnly) return true;
-  }
-  if (item.qrId) {
-    const q = String(item.qrId).toLowerCase();
-    if (q === cleanLower || q.replace(/^qr[-_:]?/i, "") === cleanLower) return true;
-  }
-
-  // 3. Formatted Generic & Sejal Barcode permutations (SFO / PI / Order / Batch with POS / Serial / srNo)
-  const sfoSources = [item.sfoNo, item.orderNo, item.piNumber, item.batchNo].filter(Boolean) as string[];
-  const seqSources = [item.posNo, item.srNo, item.serialNumber ? String(item.serialNumber).replace(/\D/g, "") : ""].filter(Boolean) as (string | number)[];
-
-  const candidatePrefixes = Array.from(new Set([BARCODE_PREFIX, ...KNOWN_BARCODE_PREFIXES, ""]));
-  for (const prefix of candidatePrefixes) {
-    for (const sfo of sfoSources) {
-      for (const seq of seqSources) {
-        const generated = formatGenericBarcode(sfo, seq, prefix);
-        if (generated === clean || generated === digitsOnly) return true;
-      }
-    }
-  }
-
-  // 4. Breakdown of numeric barcodes (Generic prefix + SFO + SEQ)
-  if (digitsOnly.length >= 12) {
-    for (const prefix of candidatePrefixes) {
-      if (prefix && digitsOnly.startsWith(prefix)) {
-        const remainder = digitsOnly.slice(prefix.length);
-        if (remainder.length >= 6) {
-          const seqPart4 = remainder.slice(-4).replace(/^0+/, "");
-          const seqPart3 = remainder.slice(-3).replace(/^0+/, "");
-          const sfoPart4 = remainder.slice(0, -4).replace(/^0+/, "");
-          const sfoPart3 = remainder.slice(0, -3).replace(/^0+/, "");
-
-          const matchesSeq = (seqP: string) =>
-            seqSources.some((seq) => {
-              const cleanSeq = String(seq).replace(/\D/g, "").replace(/^0+/, "");
-              return cleanSeq && cleanSeq === seqP;
-            });
-
-          const matchesSfo = (sfoP: string) =>
-            sfoSources.some((s) => {
-              const cleanS = String(s).replace(/\D/g, "").replace(/^0+/, "");
-              return cleanS && (cleanS === sfoP || cleanS.endsWith(sfoP) || sfoP.endsWith(cleanS));
-            });
-
-          if ((matchesSeq(seqPart4) && matchesSfo(sfoPart4)) || (matchesSeq(seqPart3) && matchesSfo(sfoPart3))) {
-            return true;
-          }
-        }
-      }
-    }
-  }
-
-  // 5. Position (POS) match (e.g. scanned "POS 1", "POS #1", "POS-1", "P1", "#1", or pure numeric "1", "3", "22")
-  if (item.posNo) {
-    const posStr = String(item.posNo).trim().toLowerCase();
-    const posDigits = posStr.replace(/\D/g, "");
-    if (
-      cleanLower === posStr ||
-      cleanLower === `pos ${posStr}` ||
-      cleanLower === `pos #${posStr}` ||
-      cleanLower === `pos-${posStr}` ||
-      cleanLower === `pos${posStr}` ||
-      cleanLower === `#${posStr}` ||
-      cleanLower === `p${posStr}` ||
-      cleanLower === `p-${posStr}` ||
-      cleanLower === `pos.${posStr}` ||
-      cleanLower === `pos. ${posStr}`
-    ) {
-      return true;
-    }
-    // Pure numeric input matching POS (e.g. operator scans or types "3" or "22")
-    if (/^\d+$/.test(clean) && digitsOnly && posDigits && (digitsOnly === posDigits || digitsOnly.replace(/^0+/, "") === posDigits.replace(/^0+/, ""))) {
-      if (digitsOnly.length <= 4) {
-        return true;
-      }
-    }
-  }
-
-  // 6. Glass Code or Item Code match (exact or normalized without spaces)
-  if (item.itemCode) {
-    const ic = String(item.itemCode).trim().toLowerCase();
-    if (ic === cleanLower || ic.replace(/[\s\-_/.]/g, "") === cleanNormalized) return true;
-  }
-  if (item.glassCode) {
-    const gc = String(item.glassCode).trim().toLowerCase();
-    if (gc === cleanLower || gc.replace(/[\s\-_/.]/g, "") === cleanNormalized) return true;
-  }
-
-  // 7. SFO / Order / OB / Batch number match (allows scanning Order/SFO/OB/Batch numbers on stickers)
-  const orderIdentifiers = [
-    { val: item.sfoNo, label: "sfo" },
-    { val: item.orderNo, label: "order" },
-    { val: item.obNo, label: "ob" },
-    { val: item.batchNo, label: "batch" },
-    { val: item.piNumber, label: "pi" },
-  ];
-  for (const ident of orderIdentifiers) {
-    if (ident.val) {
-      const v = String(ident.val).trim().toLowerCase();
-      if (v === cleanLower || `sfo ${v}` === cleanLower || `order ${v}` === cleanLower || `ob ${v}` === cleanLower || `batch ${v}` === cleanLower) {
-        return true;
-      }
-      const vDigits = v.replace(/\D/g, "").replace(/^0+/, "");
-      const inputDigits = digitsOnly.replace(/^0+/, "");
-      if (/^\d+$/.test(clean) && vDigits && inputDigits && vDigits === inputDigits && vDigits.length >= 3) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
 
 /**
  * Result of evaluating a barcode scan against the production line state.
@@ -459,7 +312,7 @@ export function evaluateScanStatus(
     };
   }
 
-  const matches = items.filter((item) => isItemMatchingCode(item, clean));
+  const matches = findMatchingItemsByCode(items, clean);
   if (matches.length === 0) {
     return {
       status: "not_found",

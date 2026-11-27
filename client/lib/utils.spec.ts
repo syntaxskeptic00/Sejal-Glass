@@ -455,5 +455,35 @@ describe("Finished vs Packing Stage Classification & Completion Rules", () => {
   });
 });
 
+describe("countPairingBufferUnits", () => {
+  it("counts 26 post-lamination DLGU Clear panes in Pairing as 13 laminated pieces while keeping pre-lamination panes individual", async () => {
+    const { countPairingBufferUnits } = await import("@shared/api");
+
+    const postLamClear = Array.from({ length: 26 }, (_, idx) => ({
+      qty: 1,
+      glassCategory: "DLGU",
+      colorOrClear: "Clear",
+      dlguPhase: "DguPairing",
+      completedStages: ["Cutting", "Pairing", "Lamination"],
+      glassType: "8MM CLEAR",
+      posNo: String(Math.floor(idx / 2) + 1),
+    }));
+
+    expect(countPairingBufferUnits(postLamClear)).toBe(13);
+
+    // Pre-lamination DLGU Clear panes (not yet laminated) remain 1:1
+    const preLamClear = Array.from({ length: 4 }, () => ({
+      qty: 1,
+      glassCategory: "DLGU",
+      colorOrClear: "Clear",
+      dlguPhase: "LamPairing",
+      completedStages: ["Cutting"],
+      glassType: "8MM CLEAR",
+    }));
+
+    expect(countPairingBufferUnits([...postLamClear, ...preLamClear])).toBe(17);
+  });
+});
+
 
 
